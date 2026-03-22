@@ -1,0 +1,8 @@
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 420px; margin: 80px auto; padding: 0 20px; color: #333; }
+h1 { font-size: 1.3em; margin-bottom: 0.5em; }
+.info { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
+label { display: block; font-size: 0.9em; margin-bottom: 4px; font-weight: 500; }
+input[type=password] { width: 100%; padding: 10px; margin-bottom: 16px; box-sizing: border-box; font-size: 1em; border: 1px solid #ccc; border-radius: 4px; }
+.btn { display: inline-block; background: #1a73e8; color: white; border: none; padding: 12px 24px; font-size: 1em; cursor: pointer; border-radius: 4px; width: 100%; text-align: center; text-decoration: none; box-sizing: border-box; }
+.btn:hover { background: #1557b0; }
+.error { color: #d32f2f; font-size: 0.9em; margin-bottom: 12px; }

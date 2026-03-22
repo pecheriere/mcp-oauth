@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ app_name }} - Authorize</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>{{ style|safe }}</style>
+</head>
+<body>
+    <h1>Authorize Access to {{ app_name }}</h1>
+    <p class="info">Authenticate with your passkey to approve this request.</p>
+    <div id="status" class="info"></div>
+    <button id="auth-btn" class="btn" onclick="startAuth()">Authenticate with Passkey</button>
+    <script id="oauth-params" type="application/json">{{ params_json|safe }}</script>
+    <script>
+    const oauthParams = JSON.parse(document.getElementById('oauth-params').textContent);
+
+    function bufToBase64url(buf) {
+        const bytes = new Uint8Array(buf);
+        let str = '';
+        for (const b of bytes) str += String.fromCharCode(b);
+        return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    }
+
+    function base64urlToBuf(b64) {
+        const str = atob(b64.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - b64.length % 4) % 4));
+        const buf = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i++) buf[i] = str.charCodeAt(i);
+        return buf.buffer;
+    }
+
+    async function startAuth() {
+        const status = document.getElementById('status');
+        const authBtn = document.getElementById('auth-btn');
+        status.textContent = 'Requesting passkey...';
+        status.className = 'info';
+        authBtn.style.display = 'none';
+
+        try {
+            const startResp = await fetch('/passkey/auth/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(oauthParams)
+            });
+            if (!startResp.ok) {
+                const err = await startResp.json();
+                throw new Error(err.error_description || err.error);
+            }
+            const { session_id, request_options } = await startResp.json();
+
+            // Decode challenge and allowCredentials
+            request_options.publicKey.challenge = base64urlToBuf(request_options.publicKey.challenge);
+            if (request_options.publicKey.allowCredentials) {
+                for (const c of request_options.publicKey.allowCredentials) {
+                    c.id = base64urlToBuf(c.id);
+                }
+            }
+
+            const assertion = await navigator.credentials.get({ publicKey: request_options.publicKey });
+
+            const body = {
+                session_id,
+                credential: {
+                    id: assertion.id,
+                    rawId: bufToBase64url(assertion.rawId),
+                    type: assertion.type,
+                    response: {
+                        authenticatorData: bufToBase64url(assertion.response.authenticatorData),
+                        clientDataJSON: bufToBase64url(assertion.response.clientDataJSON),
+                        signature: bufToBase64url(assertion.response.signature),
+                        userHandle: assertion.response.userHandle ? bufToBase64url(assertion.response.userHandle) : null
+                    }
+                }
+            };
+
+            const finishResp = await fetch('/passkey/auth/finish', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!finishResp.ok) {
+                const err = await finishResp.json();
+                throw new Error(err.error_description || err.error);
+            }
+            const { redirect_url } = await finishResp.json();
+            status.textContent = 'Authenticated! Redirecting...';
+            window.location.href = redirect_url;
+        } catch (e) {
+            status.textContent = 'Authentication failed: ' + e.message;
+            status.className = 'error';
+            authBtn.textContent = 'Retry';
+            authBtn.style.display = 'block';
+        }
+    }
+
+    if (!window.PublicKeyCredential) {
+        document.getElementById('status').textContent = 'Passkeys are not supported in this browser.';
+        document.getElementById('status').className = 'error';
+        document.getElementById('auth-btn').style.display = 'none';
+    }
+    </script>
+</body>
+</html>
