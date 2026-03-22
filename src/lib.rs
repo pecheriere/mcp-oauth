@@ -44,9 +44,7 @@
 
 pub mod store;
 
-pub use store::json_file::{
-    JsonFileClientStore, JsonFilePasskeyStore, JsonFileTokenStore,
-};
+pub use store::json_file::{JsonFileClientStore, JsonFilePasskeyStore, JsonFileTokenStore};
 pub use store::{
     AccessTokenEntry, AuthCode, ClientStore, PasskeyStore, RefreshTokenEntry, RegisteredClient,
     StoreError, TokenStore,
@@ -54,7 +52,7 @@ pub use store::{
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -148,6 +146,13 @@ impl OAuthConfig {
         // L5: Validate non-empty credentials to prevent empty-string bypass
         assert!(!client_id.is_empty(), "client_id must not be empty");
         assert!(!client_secret.is_empty(), "client_secret must not be empty");
+        // Defense-in-depth: reject paths with parent-directory traversal components
+        assert!(
+            !passkey_store_path
+                .components()
+                .any(|c| c == Component::ParentDir),
+            "passkey_store_path must not contain '..' components"
+        );
 
         Self {
             server_url,
@@ -337,11 +342,7 @@ async fn rate_limit_middleware(
 /// to [`build_oauth_router_with_stores`].
 pub fn create_default_stores(
     config: &OAuthConfig,
-) -> (
-    impl TokenStore,
-    impl ClientStore,
-    impl PasskeyStore,
-) {
+) -> (impl TokenStore, impl ClientStore, impl PasskeyStore) {
     let (token_store, client_store, summary) =
         store::json_file::create_json_file_stores(&config.passkey_store_path);
 
@@ -374,7 +375,13 @@ pub fn create_default_stores(
 )]
 pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Router {
     let (token_store, client_store, passkey_store) = create_default_stores(&config);
-    build_oauth_router_with_stores(protected_router, config, token_store, client_store, passkey_store)
+    build_oauth_router_with_stores(
+        protected_router,
+        config,
+        token_store,
+        client_store,
+        passkey_store,
+    )
 }
 
 /// Wraps `protected_router` with OAuth 2.1 endpoints and Bearer-token middleware.
@@ -414,7 +421,8 @@ where
 
     tracing::info!(
         "Token/passkey files are stored at {:?}. Ensure this directory is owned by the service user with 0o700 permissions.",
-        config.passkey_store_path
+        config
+            .passkey_store_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new(".")),
     );
@@ -439,8 +447,14 @@ where
         .route("/register", post(register_client::<T, C, P>))
         .route("/token", post(token::<T, C, P>))
         .route("/passkey/register", get(passkey_register_page::<T, C, P>))
-        .route("/passkey/register/start", post(passkey_register_start::<T, C, P>))
-        .route("/passkey/register/finish", post(passkey_register_finish::<T, C, P>))
+        .route(
+            "/passkey/register/start",
+            post(passkey_register_start::<T, C, P>),
+        )
+        .route(
+            "/passkey/register/finish",
+            post(passkey_register_finish::<T, C, P>),
+        )
         .route("/passkey/auth/start", post(passkey_auth_start::<T, C, P>))
         .route("/passkey/auth/finish", post(passkey_auth_finish::<T, C, P>))
         .with_state(store.clone())
@@ -474,7 +488,10 @@ where
 
     // Protected routes: lenient rate limiting (60 req/min per IP), then auth
     let protected = protected_router
-        .layer(middleware::from_fn_with_state(store, auth_middleware::<T, C, P>))
+        .layer(middleware::from_fn_with_state(
+            store,
+            auth_middleware::<T, C, P>,
+        ))
         .layer(middleware::from_fn_with_state(
             lenient_limiter,
             rate_limit_middleware,
@@ -1179,10 +1196,7 @@ async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
             Err(unauthorized_response(&store.config.server_url))
         }
         Ok(None) => {
-            tracing::warn!(
-                "Auth middleware: token {}... NOT FOUND",
-                token_prefix,
-            );
+            tracing::warn!("Auth middleware: token {}... NOT FOUND", token_prefix,);
             Err(unauthorized_response(&store.config.server_url))
         }
         Err(e) => {
@@ -1193,10 +1207,7 @@ async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
 }
 
 /// Map a [`StoreError`] to an HTTP error response.
-fn store_error_response(
-    description: &str,
-    err: &StoreError,
-) -> (StatusCode, Json<ErrorResponse>) {
+fn store_error_response(description: &str, err: &StoreError) -> (StatusCode, Json<ErrorResponse>) {
     tracing::error!("Store error: {err}");
     let status = match err {
         StoreError::CapacityExceeded => StatusCode::TOO_MANY_REQUESTS,
@@ -1343,7 +1354,9 @@ async fn passkey_register_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     {
         let now = now_epoch();
         let mut states = store.registration_states.lock().await;
-        states.retain(|_, (_, created_at)| now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS);
+        states.retain(|_, (_, created_at)| {
+            now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS
+        });
         if states.len() >= MAX_REGISTRATION_STATES {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1401,16 +1414,20 @@ async fn passkey_register_finish<T: TokenStore, C: ClientStore, P: PasskeyStore>
 
     // Atomically check-and-insert to prevent TOCTOU race where multiple
     // registrations are started concurrently before the first one completes.
-    let added = store.passkey_store.add_passkey_if_none(passkey).await.map_err(|e| {
-        tracing::error!("Failed to save passkey: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "storage_error".into(),
-                error_description: Some("Failed to persist passkey.".into()),
-            }),
-        )
-    })?;
+    let added = store
+        .passkey_store
+        .add_passkey_if_none(passkey)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to save passkey: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "storage_error".into(),
+                    error_description: Some("Failed to persist passkey.".into()),
+                }),
+            )
+        })?;
 
     if !added {
         return Err((
@@ -1545,7 +1562,9 @@ async fn passkey_auth_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     {
         let now = now_epoch();
         let mut states = store.authentication_states.lock().await;
-        states.retain(|_, (_, _, created_at)| now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS);
+        states.retain(|_, (_, _, created_at)| {
+            now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS
+        });
         if states.len() >= MAX_AUTHENTICATION_STATES {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1916,6 +1935,19 @@ mod tests {
             String::new(),
             "App".into(),
             PathBuf::from("pk.json"),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "passkey_store_path must not contain '..' components")]
+    fn test_config_rejects_path_traversal() {
+        let _ = OAuthConfig::with_defaults(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("/data/../etc/passkeys.json"),
             None,
         );
     }
@@ -2302,9 +2334,9 @@ mod tests {
     #[test]
     fn test_load_tokens_missing_file() {
         // Use the passkey store constructor with a non-existent path
-        let (_, _, summary) = store::json_file::create_json_file_stores(
-            std::path::Path::new("/nonexistent/passkeys.json"),
-        );
+        let (_, _, summary) = store::json_file::create_json_file_stores(std::path::Path::new(
+            "/nonexistent/passkeys.json",
+        ));
         assert_eq!(summary.access_tokens, 0);
         assert_eq!(summary.refresh_tokens, 0);
         assert_eq!(summary.registered_clients, 0);

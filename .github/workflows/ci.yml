@@ -5,11 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -18,6 +22,8 @@ jobs:
       - run: cargo test
 
   clippy:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -28,6 +34,8 @@ jobs:
       - run: cargo clippy -- -D warnings
 
   fmt:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -37,6 +45,8 @@ jobs:
       - run: cargo fmt --check
 
   audit:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -45,6 +55,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   deny:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

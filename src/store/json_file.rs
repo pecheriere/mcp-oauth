@@ -56,8 +56,7 @@ impl SharedState {
             refresh_tokens: self.refresh_tokens.clone(),
             registered_clients: self.registered_clients.clone(),
         };
-        save_tokens(&self.tokens_path, &persisted)
-            .map_err(StoreError::Backend)
+        save_tokens(&self.tokens_path, &persisted).map_err(StoreError::Backend)
     }
 }
 
@@ -73,11 +72,7 @@ impl SharedState {
 #[must_use]
 pub(crate) fn create_json_file_stores(
     passkey_store_path: &Path,
-) -> (
-    impl TokenStore,
-    impl ClientStore,
-    StoreSummary,
-) {
+) -> (impl TokenStore, impl ClientStore, StoreSummary) {
     let tp = tokens_path(passkey_store_path);
     let persisted = load_tokens(&tp);
 
@@ -99,9 +94,7 @@ pub(crate) fn create_json_file_stores(
     let token_store = JsonFileTokenStore {
         state: Arc::clone(&shared),
     };
-    let client_store = JsonFileClientStore {
-        state: shared,
-    };
+    let client_store = JsonFileClientStore { state: shared };
 
     (token_store, client_store, summary)
 }
@@ -160,18 +153,12 @@ impl TokenStore for JsonFileTokenStore {
         s.persist()
     }
 
-    async fn get_access_token(
-        &self,
-        token: &str,
-    ) -> Result<Option<AccessTokenEntry>, StoreError> {
+    async fn get_access_token(&self, token: &str) -> Result<Option<AccessTokenEntry>, StoreError> {
         let s = self.state.lock().await;
         Ok(s.access_tokens.get(token).cloned())
     }
 
-    async fn revoke_access_tokens_by_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> Result<(), StoreError> {
+    async fn revoke_access_tokens_by_refresh(&self, refresh_token: &str) -> Result<(), StoreError> {
         let mut s = self.state.lock().await;
         s.access_tokens
             .retain(|_, v| v.refresh_token != refresh_token);
@@ -349,7 +336,10 @@ impl PasskeyStore for JsonFilePasskeyStore {
 // plaintext secrets. Ensure the data directory is owned by the service user
 // and not world-readable. On a public-facing deployment, consider mounting
 // the data directory on a tmpfs or encrypted filesystem.
-pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn atomic_write(
+    path: &Path,
+    data: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -377,7 +367,10 @@ pub(crate) fn load_passkeys(path: &Path) -> Vec<Passkey> {
         .unwrap_or_default()
 }
 
-fn save_passkeys(path: &Path, passkeys: &[Passkey]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn save_passkeys(
+    path: &Path,
+    passkeys: &[Passkey],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     atomic_write(path, serde_json::to_string_pretty(passkeys)?.as_bytes())
 }
 
@@ -392,7 +385,10 @@ fn load_tokens(path: &Path) -> PersistedTokens {
         .unwrap_or_default()
 }
 
-fn save_tokens(path: &Path, tokens: &PersistedTokens) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn save_tokens(
+    path: &Path,
+    tokens: &PersistedTokens,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     atomic_write(path, serde_json::to_string_pretty(tokens)?.as_bytes())
 }
 
@@ -428,10 +424,7 @@ mod tests {
         let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
 
         let entry = AccessTokenEntry::new("cid".into(), 1000, 3600, "rt1".into());
-        store
-            .store_access_token("at1".into(), entry)
-            .await
-            .unwrap();
+        store.store_access_token("at1".into(), entry).await.unwrap();
 
         let got = store.get_access_token("at1").await.unwrap();
         assert!(got.is_some());
@@ -491,10 +484,7 @@ mod tests {
             .unwrap();
 
         // Revoke only tokens associated with rt-a
-        store
-            .revoke_access_tokens_by_refresh("rt-a")
-            .await
-            .unwrap();
+        store.revoke_access_tokens_by_refresh("rt-a").await.unwrap();
 
         // at1 should be gone, at2 should remain
         assert!(store.get_access_token("at1").await.unwrap().is_none());
@@ -601,9 +591,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(
-            client_store.get_client("client1").await.unwrap().is_some()
-        );
+        assert!(client_store.get_client("client1").await.unwrap().is_some());
     }
 
     // -- ClientStore tests --

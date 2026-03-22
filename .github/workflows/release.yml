@@ -5,11 +5,15 @@ on:
     tags:
       - "v*"
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   verify:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -22,6 +26,8 @@ jobs:
 
   publish:
     needs: verify
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

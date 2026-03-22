@@ -36,7 +36,12 @@ impl AuthCode {
         code_challenge: String,
         created_at: u64,
     ) -> Self {
-        Self { client_id, redirect_uri, code_challenge, created_at }
+        Self {
+            client_id,
+            redirect_uri,
+            code_challenge,
+            created_at,
+        }
     }
 }
 
@@ -58,7 +63,12 @@ impl AccessTokenEntry {
         expires_in_secs: u64,
         refresh_token: String,
     ) -> Self {
-        Self { client_id, created_at, expires_in_secs, refresh_token }
+        Self {
+            client_id,
+            created_at,
+            expires_in_secs,
+            refresh_token,
+        }
     }
 }
 
@@ -87,7 +97,10 @@ pub struct RegisteredClient {
 impl RegisteredClient {
     #[must_use]
     pub const fn new(client_secret: String, redirect_uris: Vec<String>) -> Self {
-        Self { client_secret, redirect_uris }
+        Self {
+            client_secret,
+            redirect_uris,
+        }
     }
 }
 
@@ -250,10 +263,7 @@ pub trait PasskeyStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
     /// Persist a newly registered passkey.
-    fn add_passkey(
-        &self,
-        passkey: Passkey,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    fn add_passkey(&self, passkey: Passkey) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Update credential counters after a successful authentication.
     fn update_passkey(
