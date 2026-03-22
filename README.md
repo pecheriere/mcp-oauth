@@ -2,6 +2,7 @@
 
 A reusable OAuth 2.1 layer for [MCP](https://modelcontextprotocol.io) (Model Context Protocol) servers, designed for compatibility with [Claude.ai](https://claude.ai).
 
+[![CI](https://github.com/pecheriere/mcp-oauth/actions/workflows/ci.yml/badge.svg)](https://github.com/pecheriere/mcp-oauth/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/mcp-oauth.svg)](https://crates.io/crates/mcp-oauth)
 [![Documentation](https://docs.rs/mcp-oauth/badge.svg)](https://docs.rs/mcp-oauth)
 [![License](https://img.shields.io/crates/l/mcp-oauth.svg)](LICENSE-MIT)
