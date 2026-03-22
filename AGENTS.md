@@ -18,16 +18,22 @@ cargo doc --no-deps  # generate API docs
 
 ## Architecture
 
-The entire library lives in **`src/lib.rs`** (single-file crate). HTML templates are in `templates/`.
+Source is split across `src/lib.rs` (handlers, router, config) and `src/store/` (storage traits and implementations). HTML templates are in `templates/`.
 
 ### Public API
 
 - `OAuthConfig` -- configuration struct (server URL, client credentials, app name, token lifetimes). Constructed via `OAuthConfig::with_defaults()`.
-- `build_oauth_router(protected_router: Router, config: OAuthConfig) -> Router` -- wraps an axum `Router` with OAuth endpoints + Bearer token middleware.
+- `build_oauth_router_with_stores(protected_router, config, token_store, client_store, passkey_store)` -- wraps an axum `Router` with OAuth endpoints + Bearer token middleware using pluggable storage backends.
+- `create_default_stores(&config)` -- creates the default JSON-file-backed stores.
+- `build_oauth_router` -- **deprecated** (v0.2.0), delegates to `build_oauth_router_with_stores` with default stores.
+
+### Storage traits
+
+`TokenStore`, `ClientStore`, `PasskeyStore` -- async traits in `src/store/mod.rs` defining all storage operations. Default JSON-file-backed implementations live in `src/store/json_file.rs`. State types (`AuthCode`, `AccessTokenEntry`, `RefreshTokenEntry`, `RegisteredClient`) are `#[non_exhaustive]` with `new()` constructors.
 
 ### Internal state
 
-`OAuthStore` holds all state in `tokio::sync::Mutex<HashMap<...>>` maps (auth codes, access tokens, refresh tokens, registered clients). State is in-memory only -- no database required.
+`OAuthServer<T, C, P>` is generic over the three store traits. Transient WebAuthn state (registration/authentication sessions, auth session cookies) lives in-memory on `OAuthServer` and is not behind the storage traits.
 
 ### OAuth flow
 
@@ -49,6 +55,34 @@ The entire library lives in **`src/lib.rs`** (single-file crate). HTML templates
 ## Dependencies
 
 Key crates: `axum` (HTTP), `tokio` (async), `webauthn-rs` (passkeys), `governor` (rate limiting), `sha2`/`subtle` (crypto), `askama` (templates).
+
+## Testing requirements
+
+**Unit tests are mandatory** for all new features and bug fixes. This is not optional.
+
+- Every new public function, trait method, or behavior change must have corresponding tests.
+- Bug fixes must include a regression test that would have caught the bug.
+- Store-level tests live in `src/store/json_file.rs` (`mod tests`). Integration tests (HTTP-level) live in `src/lib.rs` (`mod tests`).
+
+### No test slop
+
+Tests must be meaningful. A test that cannot fail is worse than no test — it adds noise and false confidence.
+
+- **Test behavior, not implementation.** Assert on observable outcomes (return values, HTTP status codes, state changes), not on internal details like which function was called.
+- **Each test must be able to fail.** If you can't describe a realistic code change that would make the test fail, delete it. A test that just calls a constructor and asserts it didn't panic is not a test.
+- **One clear assertion per test.** Test names should describe the scenario and expected outcome (e.g. `test_refresh_token_wrong_client_id_preserves_token`, not `test_refresh_token_3`).
+- **No tautological assertions.** Don't assert that `true == true` or that a value you just constructed has the fields you set. Assert on the *system's* behavior after an operation.
+- **Prefer fewer strong tests over many weak ones.** A single test that exercises a full flow (store → retrieve → verify → reload → verify persisted) is worth more than five trivial getter tests.
+
+### Design for testability
+
+Write code so it can be tested in isolation:
+
+- **Inject dependencies via traits** -- this is why `TokenStore`, `ClientStore`, `PasskeyStore` exist. New storage operations go through these traits, not directly on structs.
+- **Accept time as a parameter** where deterministic behavior matters (e.g. `cleanup_expired_tokens(now: u64)`). Do not call `now_epoch()` deep inside a call chain if the caller could pass the value.
+- **Prefer pure functions** -- separate validation logic from I/O so it can be tested without a running server.
+- **Atomic operations for check-then-act** -- if a check and a mutation must happen together, make it a single trait method (e.g. `register_client_if_none`, `add_passkey_if_none`) to prevent TOCTOU races and make the atomicity testable.
+- **Use `saturating_sub`** for all timestamp arithmetic -- never bare subtraction on `u64` timestamps.
 
 ## Contributing
 

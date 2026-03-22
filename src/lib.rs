@@ -4,7 +4,7 @@
 //! (Model Context Protocol) servers, designed for compatibility with Claude.ai.
 //!
 //! This crate is not a standalone binary — consumers import it and call
-//! [`build_oauth_router`] to wrap their [axum](https://docs.rs/axum) `Router`
+//! [`build_oauth_router_with_stores`] to wrap their [axum](https://docs.rs/axum) `Router`
 //! with a complete OAuth 2.1 implementation.
 //!
 //! ## Features
@@ -14,13 +14,13 @@
 //! - **`WebAuthn` / passkey authentication** — passwordless approval via hardware keys or biometrics
 //! - **Token refresh** — long-lived sessions via refresh tokens
 //! - **Per-IP rate limiting** — three tiers (auth, registration, general)
-//! - **In-memory state** with TTL-based cleanup — no database required
+//! - **Pluggable storage** via [`TokenStore`], [`ClientStore`], [`PasskeyStore`] traits
 //!
 //! ## Quick start
 //!
 //! ```rust,no_run
 //! use axum::Router;
-//! use mcp_oauth::{OAuthConfig, build_oauth_router};
+//! use mcp_oauth::{OAuthConfig, build_oauth_router_with_stores};
 //! use std::path::PathBuf;
 //!
 //! let mcp_routes = Router::new(); // your protected MCP routes
@@ -34,14 +34,27 @@
 //!     Some("initial-setup-token".into()),
 //! );
 //!
-//! let app = build_oauth_router(mcp_routes, config);
+//! let (token_store, client_store, passkey_store) =
+//!     mcp_oauth::create_default_stores(&config);
+//! let app = build_oauth_router_with_stores(
+//!     mcp_routes, config, token_store, client_store, passkey_store,
+//! );
 //! // Serve `app` with axum / hyper as usual.
 //! ```
 
+pub mod store;
+
+pub use store::json_file::{
+    JsonFileClientStore, JsonFilePasskeyStore, JsonFileTokenStore,
+};
+pub use store::{
+    AccessTokenEntry, AuthCode, ClientStore, PasskeyStore, RefreshTokenEntry, RegisteredClient,
+    StoreError, TokenStore,
+};
+
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -150,42 +163,8 @@ impl OAuthConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Internal stores
+// Internal server state
 // ---------------------------------------------------------------------------
-
-struct AuthCode {
-    client_id: String,
-    redirect_uri: String,
-    code_challenge: String,
-    created_at: u64, // epoch seconds
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct AccessTokenEntry {
-    client_id: String,
-    created_at: u64, // epoch seconds
-    expires_in_secs: u64,
-    refresh_token: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct RefreshTokenEntry {
-    client_id: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct RegisteredClient {
-    client_secret: String,
-    redirect_uris: Vec<String>,
-}
-
-// Persisted state for tokens and registered clients
-#[derive(Serialize, Deserialize, Default)]
-struct PersistedTokens {
-    access_tokens: HashMap<String, AccessTokenEntry>,
-    refresh_tokens: HashMap<String, RefreshTokenEntry>,
-    registered_clients: HashMap<String, RegisteredClient>,
-}
 
 #[derive(Clone)]
 struct PendingAuthApproval {
@@ -198,23 +177,17 @@ struct PendingAuthApproval {
 }
 
 // H2: Capacity limits to prevent memory exhaustion DoS
-const MAX_AUTH_CODES: usize = 10_000;
-const MAX_ACCESS_TOKENS: usize = 10_000;
-const MAX_REFRESH_TOKENS: usize = 10_000;
 const MAX_REGISTRATION_STATES: usize = 10_000;
 const MAX_AUTHENTICATION_STATES: usize = 10_000;
-const TRANSIENT_STATE_TTL_SECS: u64 = 300;
+use store::TRANSIENT_STATE_TTL_SECS;
 
-struct OAuthStore {
+struct OAuthServer<T: TokenStore, C: ClientStore, P: PasskeyStore> {
     config: OAuthConfig,
-    auth_codes: Mutex<HashMap<String, AuthCode>>,
-    access_tokens: Mutex<HashMap<String, AccessTokenEntry>>,
-    refresh_tokens: Mutex<HashMap<String, RefreshTokenEntry>>,
-    registered_clients: Mutex<HashMap<String, RegisteredClient>>,
+    token_store: T,
+    client_store: C,
+    passkey_store: P,
     // Passkey / WebAuthn state
     webauthn: Webauthn,
-    passkeys: Mutex<Vec<Passkey>>,
-    passkey_store_path: PathBuf,
     // H2: Timestamps added for TTL-based cleanup
     registration_states: Mutex<HashMap<String, (PasskeyRegistration, u64)>>,
     authentication_states:
@@ -228,7 +201,7 @@ const ALLOWED_REDIRECT_URIS: &[&str] = &[
     "https://claude.com/api/mcp/auth_callback",
 ];
 
-type AppState = Arc<OAuthStore>;
+type AppState<T, C, P> = Arc<OAuthServer<T, C, P>>;
 
 // L3: Return Result instead of silently falling back to "localhost"
 fn extract_domain(server_url: &str) -> Result<String, String> {
@@ -238,124 +211,7 @@ fn extract_domain(server_url: &str) -> Result<String, String> {
         .ok_or_else(|| format!("cannot extract domain from URL: {server_url}"))
 }
 
-fn load_passkeys(path: &Path) -> Vec<Passkey> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-// M3: Atomic file write with restrictive permissions (0o600 on Unix).
-//
-// SECURITY NOTE: Persisted token files (tokens.json, passkeys.json) contain
-// plaintext secrets. Ensure the data directory is owned by the service user
-// and not world-readable. On a public-facing deployment, consider mounting
-// the data directory on a tmpfs or encrypted filesystem.
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp_path = path.with_extension("tmp");
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&temp_path)?;
-        file.write_all(data)?;
-        file.flush()?;
-    }
-    std::fs::rename(&temp_path, path)?;
-    Ok(())
-}
-
-fn save_passkeys(path: &Path, passkeys: &[Passkey]) -> Result<(), Box<dyn std::error::Error>> {
-    atomic_write(path, serde_json::to_string_pretty(passkeys)?.as_bytes())
-}
-
-fn tokens_path(passkey_path: &Path) -> PathBuf {
-    passkey_path.with_file_name("tokens.json")
-}
-
-fn load_tokens(path: &Path) -> PersistedTokens {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_tokens(path: &Path, tokens: &PersistedTokens) -> Result<(), Box<dyn std::error::Error>> {
-    atomic_write(path, serde_json::to_string_pretty(tokens)?.as_bytes())
-}
-
-impl OAuthStore {
-    #[allow(clippy::expect_used)]
-    fn new(config: OAuthConfig) -> Self {
-        let rp_id =
-            extract_domain(&config.server_url).expect("invalid server_url: cannot extract domain");
-        let rp_origin = Url::parse(&config.server_url).expect("invalid server_url");
-        let webauthn = WebauthnBuilder::new(&rp_id, &rp_origin)
-            .expect("Failed to build WebAuthn")
-            .rp_name(&config.app_name)
-            .build()
-            .expect("Failed to build WebAuthn");
-
-        let passkeys = load_passkeys(&config.passkey_store_path);
-        let passkey_store_path = config.passkey_store_path.clone();
-        let tp = tokens_path(&passkey_store_path);
-        let persisted = load_tokens(&tp);
-
-        tracing::info!(
-            "OAuth store loaded: {} passkeys, {} access_tokens, {} refresh_tokens, {} registered_clients from {:?}",
-            passkeys.len(),
-            persisted.access_tokens.len(),
-            persisted.refresh_tokens.len(),
-            persisted.registered_clients.len(),
-            tp,
-        );
-        tracing::info!(
-            "Token/passkey files are stored at {:?}. Ensure this directory is owned by the service user with 0o700 permissions.",
-            passkey_store_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        );
-
-        if passkeys.is_empty() {
-            tracing::warn!("=== FIRST-TIME SETUP REQUIRED ===");
-            tracing::warn!(
-                "No passkeys registered. Visit {}/passkey/register?setup_token=<SETUP_TOKEN> to register one.",
-                config.server_url
-            );
-            tracing::warn!("Built-in OAuth client credentials (provide these to your MCP client):");
-            tracing::warn!("  Client ID:     {}", config.client_id);
-            tracing::warn!("  Client Secret: (set via OAUTH_CLIENT_SECRET env var)");
-            tracing::warn!("After registering a passkey, registration will be permanently locked.");
-        } else {
-            tracing::info!(
-                "Server is locked: {} passkey(s) registered, {} dynamic client(s).",
-                passkeys.len(),
-                persisted.registered_clients.len()
-            );
-        }
-
-        Self {
-            config,
-            auth_codes: Mutex::new(HashMap::new()),
-            access_tokens: Mutex::new(persisted.access_tokens),
-            refresh_tokens: Mutex::new(persisted.refresh_tokens),
-            registered_clients: Mutex::new(persisted.registered_clients),
-            webauthn,
-            passkeys: Mutex::new(passkeys),
-            passkey_store_path,
-            registration_states: Mutex::new(HashMap::new()),
-            authentication_states: Mutex::new(HashMap::new()),
-            auth_session_token: Mutex::new(None),
-        }
-    }
-
+impl<T: TokenStore, C: ClientStore, P: PasskeyStore> OAuthServer<T, C, P> {
     // H1: Constant-time secret comparison to prevent timing side-channels
     async fn validate_client(&self, client_id: &str, client_secret: &str) -> bool {
         let id_match = constant_time_eq(client_id, &self.config.client_id);
@@ -363,48 +219,36 @@ impl OAuthStore {
         if id_match && secret_match {
             return true;
         }
-        let clients = self.registered_clients.lock().await;
-        clients
-            .get(client_id)
-            .is_some_and(|c| constant_time_eq(client_secret, &c.client_secret))
+        match self.client_store.get_client(client_id).await {
+            Ok(Some(c)) => constant_time_eq(client_secret, &c.client_secret),
+            _ => false,
+        }
     }
 
     async fn is_known_client(&self, client_id: &str) -> bool {
         if client_id == self.config.client_id {
             return true;
         }
-        self.registered_clients.lock().await.contains_key(client_id)
+        matches!(self.client_store.get_client(client_id).await, Ok(Some(_)))
     }
 
     async fn is_redirect_uri_allowed(&self, client_id: &str, redirect_uri: &str) -> bool {
         if ALLOWED_REDIRECT_URIS.contains(&redirect_uri) {
             return true;
         }
-        let clients = self.registered_clients.lock().await;
-        clients
-            .get(client_id)
-            .is_some_and(|c| c.redirect_uris.iter().any(|u| u == redirect_uri))
+        match self.client_store.get_client(client_id).await {
+            Ok(Some(c)) => c.redirect_uris.iter().any(|u| u == redirect_uri),
+            _ => false,
+        }
     }
 
     async fn has_passkeys(&self) -> bool {
-        !self.passkeys.lock().await.is_empty()
-    }
-
-    // M2: Acquire all locks atomically for consistent snapshot
-    async fn persist_tokens(&self) {
-        let access = self.access_tokens.lock().await;
-        let refresh = self.refresh_tokens.lock().await;
-        let clients = self.registered_clients.lock().await;
-        let persisted = PersistedTokens {
-            access_tokens: access.clone(),
-            refresh_tokens: refresh.clone(),
-            registered_clients: clients.clone(),
-        };
-        drop(clients);
-        drop(refresh);
-        drop(access);
-        if let Err(e) = save_tokens(&tokens_path(&self.passkey_store_path), &persisted) {
-            tracing::error!("Failed to persist tokens: {e}");
+        match self.passkey_store.has_passkeys().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Passkey store error in has_passkeys: {e}");
+                false
+            }
         }
     }
 
@@ -484,8 +328,54 @@ async fn rate_limit_middleware(
 }
 
 // ---------------------------------------------------------------------------
-// Public API: build_oauth_router
+// Public API: create_default_stores
 // ---------------------------------------------------------------------------
+
+/// Create the default JSON-file-backed stores from an [`OAuthConfig`].
+///
+/// Returns `(token_store, client_store, passkey_store)` suitable for passing
+/// to [`build_oauth_router_with_stores`].
+pub fn create_default_stores(
+    config: &OAuthConfig,
+) -> (
+    impl TokenStore,
+    impl ClientStore,
+    impl PasskeyStore,
+) {
+    let (token_store, client_store, summary) =
+        store::json_file::create_json_file_stores(&config.passkey_store_path);
+
+    tracing::info!(
+        "OAuth store loaded: {} access_tokens, {} refresh_tokens, {} registered_clients from {:?}",
+        summary.access_tokens,
+        summary.refresh_tokens,
+        summary.registered_clients,
+        summary.tokens_path,
+    );
+
+    let passkey_store = JsonFilePasskeyStore::new(config.passkey_store_path.clone());
+
+    (token_store, client_store, passkey_store)
+}
+
+// ---------------------------------------------------------------------------
+// Public API: build_oauth_router (deprecated) and build_oauth_router_with_stores
+// ---------------------------------------------------------------------------
+
+/// Wraps `protected_router` with OAuth 2.1 endpoints and Bearer-token middleware.
+///
+/// # Deprecated
+///
+/// Use [`build_oauth_router_with_stores`] with explicit store implementations instead.
+/// This function creates default JSON-file-backed stores from the config.
+#[deprecated(
+    since = "0.2.0",
+    note = "use `build_oauth_router_with_stores` with explicit store implementations"
+)]
+pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Router {
+    let (token_store, client_store, passkey_store) = create_default_stores(&config);
+    build_oauth_router_with_stores(protected_router, config, token_store, client_store, passkey_store)
+}
 
 /// Wraps `protected_router` with OAuth 2.1 endpoints and Bearer-token middleware.
 ///
@@ -495,8 +385,50 @@ async fn rate_limit_middleware(
 /// - **Strict (10 req/min):** `/token`, `/register`, `/passkey/*` — auth brute-force protection
 /// - **Moderate (30 req/min):** `/authorize`, `/.well-known/*`, `/health` — OAuth flow, metadata
 /// - **Lenient (60 req/min):** `/mcp` (protected routes) — already behind Bearer auth
-pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Router {
-    let store: AppState = Arc::new(OAuthStore::new(config));
+///
+/// # Panics
+///
+/// Panics if `config.server_url` is not a valid URL or has no host component,
+/// or if the `WebAuthn` builder fails (invalid RP configuration).
+#[allow(clippy::expect_used)]
+pub fn build_oauth_router_with_stores<T, C, P>(
+    protected_router: Router,
+    config: OAuthConfig,
+    token_store: T,
+    client_store: C,
+    passkey_store: P,
+) -> Router
+where
+    T: TokenStore,
+    C: ClientStore,
+    P: PasskeyStore,
+{
+    let rp_id =
+        extract_domain(&config.server_url).expect("invalid server_url: cannot extract domain");
+    let rp_origin = Url::parse(&config.server_url).expect("invalid server_url");
+    let webauthn = WebauthnBuilder::new(&rp_id, &rp_origin)
+        .expect("Failed to build WebAuthn")
+        .rp_name(&config.app_name)
+        .build()
+        .expect("Failed to build WebAuthn");
+
+    tracing::info!(
+        "Token/passkey files are stored at {:?}. Ensure this directory is owned by the service user with 0o700 permissions.",
+        config.passkey_store_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
+
+    let store: AppState<T, C, P> = Arc::new(OAuthServer {
+        config,
+        token_store,
+        client_store,
+        passkey_store,
+        webauthn,
+        registration_states: Mutex::new(HashMap::new()),
+        authentication_states: Mutex::new(HashMap::new()),
+        auth_session_token: Mutex::new(None),
+    });
 
     let strict_limiter = create_rate_limiter(10);
     let moderate_limiter = create_rate_limiter(30);
@@ -504,13 +436,13 @@ pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Rout
 
     // Auth routes: strict rate limiting (10 req/min per IP)
     let auth_routes = Router::new()
-        .route("/register", post(register_client))
-        .route("/token", post(token))
-        .route("/passkey/register", get(passkey_register_page))
-        .route("/passkey/register/start", post(passkey_register_start))
-        .route("/passkey/register/finish", post(passkey_register_finish))
-        .route("/passkey/auth/start", post(passkey_auth_start))
-        .route("/passkey/auth/finish", post(passkey_auth_finish))
+        .route("/register", post(register_client::<T, C, P>))
+        .route("/token", post(token::<T, C, P>))
+        .route("/passkey/register", get(passkey_register_page::<T, C, P>))
+        .route("/passkey/register/start", post(passkey_register_start::<T, C, P>))
+        .route("/passkey/register/finish", post(passkey_register_finish::<T, C, P>))
+        .route("/passkey/auth/start", post(passkey_auth_start::<T, C, P>))
+        .route("/passkey/auth/finish", post(passkey_auth_finish::<T, C, P>))
         .with_state(store.clone())
         .layer(middleware::from_fn_with_state(
             strict_limiter,
@@ -521,13 +453,13 @@ pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Rout
     let other_public = Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
-            get(protected_resource_metadata),
+            get(protected_resource_metadata::<T, C, P>),
         )
         .route(
             "/.well-known/oauth-authorization-server",
-            get(authorization_server_metadata),
+            get(authorization_server_metadata::<T, C, P>),
         )
-        .route("/authorize", get(authorize_get))
+        .route("/authorize", get(authorize_get::<T, C, P>))
         .route("/health", get(|| async { "ok" }))
         .with_state(store.clone())
         .layer(middleware::from_fn_with_state(
@@ -542,7 +474,7 @@ pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Rout
 
     // Protected routes: lenient rate limiting (60 req/min per IP), then auth
     let protected = protected_router
-        .layer(middleware::from_fn_with_state(store, auth_middleware))
+        .layer(middleware::from_fn_with_state(store, auth_middleware::<T, C, P>))
         .layer(middleware::from_fn_with_state(
             lenient_limiter,
             rate_limit_middleware,
@@ -597,7 +529,9 @@ async fn security_headers_middleware(req: axum::extract::Request, next: Next) ->
 // Well-known metadata endpoints
 // ---------------------------------------------------------------------------
 
-async fn protected_resource_metadata(State(store): State<AppState>) -> impl IntoResponse {
+async fn protected_resource_metadata<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
+) -> impl IntoResponse {
     let url = &store.config.server_url;
     Json(serde_json::json!({
         "resource": url,
@@ -606,9 +540,11 @@ async fn protected_resource_metadata(State(store): State<AppState>) -> impl Into
     }))
 }
 
-async fn authorization_server_metadata(State(store): State<AppState>) -> impl IntoResponse {
+async fn authorization_server_metadata<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
+) -> impl IntoResponse {
     let url = &store.config.server_url;
-    let has_clients = !store.registered_clients.lock().await.is_empty();
+    let client_count = store.client_store.client_count().await.unwrap_or(0);
     let mut metadata = serde_json::json!({
         "issuer": url,
         "authorization_endpoint": format!("{url}/authorize"),
@@ -620,7 +556,7 @@ async fn authorization_server_metadata(State(store): State<AppState>) -> impl In
         "scopes_supported": ["mcp:tools"]
     });
     // Only advertise registration endpoint when no client has been registered yet
-    if !has_clients {
+    if client_count == 0 {
         metadata["registration_endpoint"] = serde_json::json!(format!("{url}/register"));
     }
     Json(metadata)
@@ -654,27 +590,10 @@ struct RegisterClientResponse {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-async fn register_client(
-    State(store): State<AppState>,
+async fn register_client<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     Json(body): Json<RegisterClientRequest>,
 ) -> Result<Json<RegisterClientResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Hold the lock for the entire function to prevent TOCTOU race conditions.
-    // Lock dynamic client registration after first client is registered.
-    // To reset: delete tokens.json and restart the server.
-    let mut clients = store.registered_clients.lock().await;
-    if !clients.is_empty() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "registration_locked".into(),
-                error_description: Some(
-                    "Client registration is locked. A client already exists. Delete tokens.json and restart to reset."
-                        .into(),
-                ),
-            }),
-        ));
-    }
-
     for uri in &body.redirect_uris {
         if !ALLOWED_REDIRECT_URIS.contains(&uri.as_str()) {
             return Err((
@@ -702,15 +621,32 @@ async fn register_client(
         body.redirect_uris,
     );
 
-    clients.insert(
-        client_id.clone(),
-        RegisteredClient {
-            client_secret: client_secret.clone(),
-            redirect_uris: body.redirect_uris.clone(),
-        },
-    );
-    drop(clients);
-    store.persist_tokens().await;
+    // Atomically check-and-insert to prevent TOCTOU race between
+    // concurrent registration requests.
+    let registered = store
+        .client_store
+        .register_client_if_none(
+            client_id.clone(),
+            RegisteredClient {
+                client_secret: client_secret.clone(),
+                redirect_uris: body.redirect_uris.clone(),
+            },
+        )
+        .await
+        .map_err(|e| store_error_response("Failed to persist client registration", &e))?;
+
+    if !registered {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "registration_locked".into(),
+                error_description: Some(
+                    "Client registration is locked. A client already exists. Delete tokens.json and restart to reset."
+                        .into(),
+                ),
+            }),
+        ));
+    }
 
     Ok(Json(RegisterClientResponse {
         client_id,
@@ -746,8 +682,8 @@ struct AuthorizeParams {
     clippy::needless_pass_by_value,
     clippy::too_many_lines
 )]
-async fn authorize_get(
-    State(store): State<AppState>,
+async fn authorize_get<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     req: axum::extract::Request,
 ) -> Result<Response, (StatusCode, Html<String>)> {
     let query = req.uri().query().unwrap_or("");
@@ -836,19 +772,29 @@ async fn authorize_get(
         );
         let code = generate_token();
         let now = now_epoch();
-        let code_ttl = store.config.code_lifetime_secs;
-        let mut codes = store.auth_codes.lock().await;
-        codes.retain(|_, v| now.saturating_sub(v.created_at) <= code_ttl);
-        codes.insert(
-            code.clone(),
-            AuthCode {
-                client_id: client_id.to_owned(),
-                redirect_uri: redirect_uri.to_owned(),
-                code_challenge: code_challenge.to_owned(),
-                created_at: now,
-            },
-        );
-        drop(codes);
+
+        if let Err(e) = store
+            .token_store
+            .store_auth_code(
+                code.clone(),
+                AuthCode {
+                    client_id: client_id.to_owned(),
+                    redirect_uri: redirect_uri.to_owned(),
+                    code_challenge: code_challenge.to_owned(),
+                    created_at: now,
+                },
+            )
+            .await
+        {
+            tracing::error!("Failed to store auth code: {e}");
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Html(error_page(
+                    &store.config.app_name,
+                    "Too many pending authorization codes.",
+                )),
+            ));
+        }
 
         // C2: Build redirect URL safely using url::Url to properly encode parameters
         let mut redirect_url = Url::parse(redirect_uri).map_err(|_| {
@@ -917,8 +863,8 @@ struct ErrorResponse {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-async fn token(
-    State(store): State<AppState>,
+async fn token<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     Form(params): Form<TokenRequest>,
 ) -> Result<Json<TokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     let client_id = params.client_id.as_deref().unwrap_or("");
@@ -960,8 +906,8 @@ async fn token(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_authorization_code(
-    store: &OAuthStore,
+async fn handle_authorization_code<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    store: &OAuthServer<T, C, P>,
     client_id: &str,
     params: &TokenRequest,
 ) -> Result<Json<TokenResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -982,7 +928,13 @@ async fn handle_authorization_code(
         ));
     }
 
-    let Some(auth_code) = store.auth_codes.lock().await.remove(code) else {
+    let auth_code = store
+        .token_store
+        .consume_auth_code(code)
+        .await
+        .map_err(|e| store_error_response("Internal storage error", &e))?;
+
+    let Some(auth_code) = auth_code else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -992,7 +944,7 @@ async fn handle_authorization_code(
         ));
     };
 
-    if now_epoch() - auth_code.created_at > store.config.code_lifetime_secs {
+    if now_epoch().saturating_sub(auth_code.created_at) > store.config.code_lifetime_secs {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1036,49 +988,31 @@ async fn handle_authorization_code(
     let access_token = generate_token();
     let refresh_token = generate_token();
 
-    // H2: Cleanup expired tokens and enforce capacity before inserting
-    {
-        let now = now_epoch();
-        let mut tokens = store.access_tokens.lock().await;
-        tokens.retain(|_, v| now - v.created_at < v.expires_in_secs);
-        if tokens.len() >= MAX_ACCESS_TOKENS {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ErrorResponse {
-                    error: "capacity_exceeded".into(),
-                    error_description: Some("Too many active tokens".into()),
-                }),
-            ));
-        }
-        tokens.insert(
+    // Store access token (capacity checks happen inside the store)
+    store
+        .token_store
+        .store_access_token(
             access_token.clone(),
             AccessTokenEntry {
                 client_id: client_id.to_owned(),
-                created_at: now,
+                created_at: now_epoch(),
                 expires_in_secs: store.config.token_lifetime_secs,
                 refresh_token: refresh_token.clone(),
             },
-        );
-    }
-    {
-        let mut tokens = store.refresh_tokens.lock().await;
-        if tokens.len() >= MAX_REFRESH_TOKENS {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ErrorResponse {
-                    error: "capacity_exceeded".into(),
-                    error_description: Some("Too many active refresh tokens".into()),
-                }),
-            ));
-        }
-        tokens.insert(
+        )
+        .await
+        .map_err(|e| store_error_response("Too many active tokens", &e))?;
+
+    store
+        .token_store
+        .store_refresh_token(
             refresh_token.clone(),
             RefreshTokenEntry {
                 client_id: client_id.to_owned(),
             },
-        );
-    }
-    store.persist_tokens().await;
+        )
+        .await
+        .map_err(|e| store_error_response("Too many active refresh tokens", &e))?;
 
     Ok(Json(TokenResponse {
         access_token,
@@ -1089,14 +1023,23 @@ async fn handle_authorization_code(
     }))
 }
 
-async fn handle_refresh_token(
-    store: &OAuthStore,
+async fn handle_refresh_token<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    store: &OAuthServer<T, C, P>,
     client_id: &str,
     params: &TokenRequest,
 ) -> Result<Json<TokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     let refresh_token_val = params.refresh_token.as_deref().unwrap_or("");
 
-    let Some(entry) = store.refresh_tokens.lock().await.remove(refresh_token_val) else {
+    // Peek at the refresh token first (non-destructive) to validate client_id
+    // before consuming it. This prevents an attacker who knows a token value
+    // but not the correct client_id from destroying the victim's refresh token.
+    let entry = store
+        .token_store
+        .get_refresh_token(refresh_token_val)
+        .await
+        .map_err(|e| store_error_response("Internal storage error", &e))?;
+
+    let Some(entry) = entry else {
         tracing::warn!(
             "Refresh token not found (already consumed or never existed), client_id={}...",
             &client_id[..client_id.len().min(8)]
@@ -1125,6 +1068,13 @@ async fn handle_refresh_token(
         ));
     }
 
+    // Now consume (remove) the validated refresh token
+    store
+        .token_store
+        .consume_refresh_token(refresh_token_val)
+        .await
+        .map_err(|e| store_error_response("Internal storage error", &e))?;
+
     tracing::info!(
         "Refresh token valid, issuing new tokens for client_id={}...",
         &client_id[..client_id.len().min(8)]
@@ -1133,31 +1083,39 @@ async fn handle_refresh_token(
     // M1: Only revoke the specific access token associated with the consumed refresh token,
     // not all tokens for the client
     store
-        .access_tokens
-        .lock()
+        .token_store
+        .revoke_access_tokens_by_refresh(refresh_token_val)
         .await
-        .retain(|_, v| v.refresh_token != refresh_token_val);
+        .map_err(|e| store_error_response("Failed to revoke old access tokens", &e))?;
 
     // L1: Use cryptographically strong tokens
     let new_access_token = generate_token();
     let new_refresh_token = generate_token();
 
-    store.access_tokens.lock().await.insert(
-        new_access_token.clone(),
-        AccessTokenEntry {
-            client_id: client_id.to_owned(),
-            created_at: now_epoch(),
-            expires_in_secs: store.config.token_lifetime_secs,
-            refresh_token: new_refresh_token.clone(),
-        },
-    );
-    store.refresh_tokens.lock().await.insert(
-        new_refresh_token.clone(),
-        RefreshTokenEntry {
-            client_id: client_id.to_owned(),
-        },
-    );
-    store.persist_tokens().await;
+    store
+        .token_store
+        .store_access_token(
+            new_access_token.clone(),
+            AccessTokenEntry {
+                client_id: client_id.to_owned(),
+                created_at: now_epoch(),
+                expires_in_secs: store.config.token_lifetime_secs,
+                refresh_token: new_refresh_token.clone(),
+            },
+        )
+        .await
+        .map_err(|e| store_error_response("Failed to store access token", &e))?;
+
+    store
+        .token_store
+        .store_refresh_token(
+            new_refresh_token.clone(),
+            RefreshTokenEntry {
+                client_id: client_id.to_owned(),
+            },
+        )
+        .await
+        .map_err(|e| store_error_response("Failed to store refresh token", &e))?;
 
     Ok(Json(TokenResponse {
         access_token: new_access_token,
@@ -1172,8 +1130,8 @@ async fn handle_refresh_token(
 // Auth middleware for protected routes
 // ---------------------------------------------------------------------------
 
-async fn auth_middleware(
-    State(store): State<AppState>,
+async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     req: axum::extract::Request,
     next: Next,
 ) -> Result<Response, Response> {
@@ -1190,16 +1148,14 @@ async fn auth_middleware(
     let token = &h[7..];
 
     let token_prefix = &token[..token.len().min(8)];
-    let tokens = store.access_tokens.lock().await;
     let now = now_epoch();
-    match tokens.get(token) {
-        Some(entry) if now - entry.created_at < entry.expires_in_secs => {
+    match store.token_store.get_access_token(token).await {
+        Ok(Some(entry)) if now.saturating_sub(entry.created_at) < entry.expires_in_secs => {
             tracing::info!(
                 "Auth middleware: token {}... valid (age={}s)",
                 token_prefix,
-                now - entry.created_at
+                now.saturating_sub(entry.created_at)
             );
-            drop(tokens);
             let response = next.run(req).await;
             // If the inner service returned 401 but our auth was valid,
             // it's a session-not-found error from rmcp (e.g. after server restart).
@@ -1213,26 +1169,46 @@ async fn auth_middleware(
             }
             Ok(response)
         }
-        Some(entry) => {
+        Ok(Some(entry)) => {
             tracing::warn!(
                 "Auth middleware: token {}... EXPIRED (age={}s, max={}s)",
                 token_prefix,
-                now - entry.created_at,
+                now.saturating_sub(entry.created_at),
                 entry.expires_in_secs
             );
-            drop(tokens);
             Err(unauthorized_response(&store.config.server_url))
         }
-        None => {
+        Ok(None) => {
             tracing::warn!(
-                "Auth middleware: token {}... NOT FOUND ({} tokens in store)",
+                "Auth middleware: token {}... NOT FOUND",
                 token_prefix,
-                tokens.len()
             );
-            drop(tokens);
+            Err(unauthorized_response(&store.config.server_url))
+        }
+        Err(e) => {
+            tracing::error!("Auth middleware: token store error: {e}");
             Err(unauthorized_response(&store.config.server_url))
         }
     }
+}
+
+/// Map a [`StoreError`] to an HTTP error response.
+fn store_error_response(
+    description: &str,
+    err: &StoreError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!("Store error: {err}");
+    let status = match err {
+        StoreError::CapacityExceeded => StatusCode::TOO_MANY_REQUESTS,
+        StoreError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: "server_error".into(),
+            error_description: Some(description.into()),
+        }),
+    )
 }
 
 fn unauthorized_response(server_url: &str) -> Response {
@@ -1275,8 +1251,8 @@ struct PasskeyRegisterPageQuery {
     setup_token: Option<String>,
 }
 
-async fn passkey_register_page(
-    State(store): State<AppState>,
+async fn passkey_register_page<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     axum::extract::Query(query): axum::extract::Query<PasskeyRegisterPageQuery>,
 ) -> Html<String> {
     let has_passkeys = store.has_passkeys().await;
@@ -1294,8 +1270,8 @@ async fn passkey_register_page(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-async fn passkey_register_start(
-    State(store): State<AppState>,
+async fn passkey_register_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyRegisterStartRequest>,
 ) -> Result<Json<PasskeyRegisterStartResponse>, (StatusCode, Json<ErrorResponse>)> {
     let has_passkeys = store.has_passkeys().await;
@@ -1329,9 +1305,17 @@ async fn passkey_register_start(
     }
 
     let user_unique_id = [0u8; 16]; // single-user system
-    let existing = store.passkeys.lock().await;
+    let existing = store.passkey_store.list_passkeys().await.map_err(|e| {
+        tracing::error!("Passkey store error: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "server_error".into(),
+                error_description: Some("Internal storage error".into()),
+            }),
+        )
+    })?;
     let exclude: Vec<CredentialID> = existing.iter().map(|pk| pk.cred_id().clone()).collect();
-    drop(existing);
 
     let (ccr, reg_state) = store
         .webauthn
@@ -1359,7 +1343,7 @@ async fn passkey_register_start(
     {
         let now = now_epoch();
         let mut states = store.registration_states.lock().await;
-        states.retain(|_, (_, created_at)| now - *created_at <= TRANSIENT_STATE_TTL_SECS);
+        states.retain(|_, (_, created_at)| now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS);
         if states.len() >= MAX_REGISTRATION_STATES {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1379,24 +1363,10 @@ async fn passkey_register_start(
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
-async fn passkey_register_finish(
-    State(store): State<AppState>,
+async fn passkey_register_finish<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyRegisterFinishRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Reject if a passkey already exists (prevents TOCTOU race where multiple
-    // registrations are started concurrently before the first one completes).
-    if store.has_passkeys().await {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "registration_locked".into(),
-                error_description: Some(
-                    "Passkey registration is locked. A passkey already exists.".into(),
-                ),
-            }),
-        ));
-    }
-
     let reg_state = store
         .registration_states
         .lock()
@@ -1429,19 +1399,29 @@ async fn passkey_register_finish(
             )
         })?;
 
-    {
-        let mut passkeys = store.passkeys.lock().await;
-        passkeys.push(passkey);
-        if let Err(e) = save_passkeys(&store.passkey_store_path, &passkeys) {
-            tracing::error!("Failed to save passkeys: {e}");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "storage_error".into(),
-                    error_description: Some("Failed to persist passkey.".into()),
-                }),
-            ));
-        }
+    // Atomically check-and-insert to prevent TOCTOU race where multiple
+    // registrations are started concurrently before the first one completes.
+    let added = store.passkey_store.add_passkey_if_none(passkey).await.map_err(|e| {
+        tracing::error!("Failed to save passkey: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "storage_error".into(),
+                error_description: Some("Failed to persist passkey.".into()),
+            }),
+        )
+    })?;
+
+    if !added {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "registration_locked".into(),
+                error_description: Some(
+                    "Passkey registration is locked. A passkey already exists.".into(),
+                ),
+            }),
+        ));
     }
 
     // Invalidate all other pending registration sessions to prevent
@@ -1482,8 +1462,8 @@ struct PasskeyAuthFinishResponse {
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
-async fn passkey_auth_start(
-    State(store): State<AppState>,
+async fn passkey_auth_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyAuthStartRequest>,
 ) -> Result<Json<PasskeyAuthStartResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Validate OAuth params
@@ -1518,7 +1498,16 @@ async fn passkey_auth_start(
         ));
     }
 
-    let passkeys = store.passkeys.lock().await;
+    let passkeys = store.passkey_store.list_passkeys().await.map_err(|e| {
+        tracing::error!("Passkey store error: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "server_error".into(),
+                error_description: Some("Internal storage error".into()),
+            }),
+        )
+    })?;
     if passkeys.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1556,7 +1545,7 @@ async fn passkey_auth_start(
     {
         let now = now_epoch();
         let mut states = store.authentication_states.lock().await;
-        states.retain(|_, (_, _, created_at)| now - *created_at <= TRANSIENT_STATE_TTL_SECS);
+        states.retain(|_, (_, _, created_at)| now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS);
         if states.len() >= MAX_AUTHENTICATION_STATES {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1576,8 +1565,8 @@ async fn passkey_auth_start(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-async fn passkey_auth_finish(
-    State(store): State<AppState>,
+async fn passkey_auth_finish<T: TokenStore, C: ClientStore, P: PasskeyStore>(
+    State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyAuthFinishRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let entry = store
@@ -1612,34 +1601,18 @@ async fn passkey_auth_finish(
         })?;
 
     // Update credential counter for replay protection
-    let mut passkeys = store.passkeys.lock().await;
-    for pk in passkeys.iter_mut() {
-        pk.update_credential(&auth_result);
-    }
-    if let Err(e) = save_passkeys(&store.passkey_store_path, &passkeys) {
+    if let Err(e) = store.passkey_store.update_passkey(&auth_result).await {
         tracing::error!("Failed to save updated passkey counters: {e}");
     }
-    drop(passkeys);
 
     // L1: Use cryptographically strong token for auth code
     let code = generate_token();
+    let now = now_epoch();
 
-    // H2: Cleanup expired auth codes and enforce capacity
-    {
-        let now = now_epoch();
-        let code_ttl = store.config.code_lifetime_secs;
-        let mut codes = store.auth_codes.lock().await;
-        codes.retain(|_, v| now - v.created_at <= code_ttl);
-        if codes.len() >= MAX_AUTH_CODES {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ErrorResponse {
-                    error: "capacity_exceeded".into(),
-                    error_description: Some("Too many pending authorization codes".into()),
-                }),
-            ));
-        }
-        codes.insert(
+    // Store auth code (capacity checks happen inside the store)
+    store
+        .token_store
+        .store_auth_code(
             code.clone(),
             AuthCode {
                 client_id: pending.client_id.clone(),
@@ -1647,8 +1620,18 @@ async fn passkey_auth_finish(
                 code_challenge: pending.code_challenge,
                 created_at: now,
             },
-        );
-    }
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Token store error: {e}");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: "capacity_exceeded".into(),
+                    error_description: Some("Too many pending authorization codes".into()),
+                }),
+            )
+        })?;
 
     // C2: Build redirect URL safely using url::Url to properly encode parameters
     let mut redirect_url = Url::parse(&pending.redirect_uri).map_err(|_| {
@@ -1819,7 +1802,9 @@ mod tests {
 
     fn build_test_app(dir: &std::path::Path) -> Router {
         let protected = Router::new().route("/mcp", get_route(|| async { "protected content" }));
-        build_oauth_router(protected, test_config(dir))
+        let config = test_config(dir);
+        let (token_store, client_store, passkey_store) = create_default_stores(&config);
+        build_oauth_router_with_stores(protected, config, token_store, client_store, passkey_store)
     }
 
     // -- Unit tests for helper functions --
@@ -2295,7 +2280,7 @@ mod tests {
     fn test_atomic_write_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.json");
-        atomic_write(&path, b"hello").unwrap();
+        store::json_file::atomic_write(&path, b"hello").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
     }
 
@@ -2303,22 +2288,26 @@ mod tests {
     fn test_atomic_write_creates_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("dir").join("test.json");
-        atomic_write(&path, b"nested").unwrap();
+        store::json_file::atomic_write(&path, b"nested").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nested");
     }
 
     #[test]
     fn test_load_passkeys_missing_file() {
-        let passkeys = load_passkeys(Path::new("/nonexistent/passkeys.json"));
+        let passkeys =
+            store::json_file::load_passkeys(std::path::Path::new("/nonexistent/passkeys.json"));
         assert!(passkeys.is_empty());
     }
 
     #[test]
     fn test_load_tokens_missing_file() {
-        let tokens = load_tokens(Path::new("/nonexistent/tokens.json"));
-        assert!(tokens.access_tokens.is_empty());
-        assert!(tokens.refresh_tokens.is_empty());
-        assert!(tokens.registered_clients.is_empty());
+        // Use the passkey store constructor with a non-existent path
+        let (_, _, summary) = store::json_file::create_json_file_stores(
+            std::path::Path::new("/nonexistent/passkeys.json"),
+        );
+        assert_eq!(summary.access_tokens, 0);
+        assert_eq!(summary.refresh_tokens, 0);
+        assert_eq!(summary.registered_clients, 0);
     }
 
     // -- Template rendering tests --
