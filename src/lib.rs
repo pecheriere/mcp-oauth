@@ -100,7 +100,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 use askama::Template;
 
 // L1: Generate 256-bit cryptographically random tokens (base64url-encoded)
-#[allow(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "OsRng::try_fill_bytes only fails on catastrophic OS RNG failure; panicking is the correct response for a security-critical token generator"
+)]
 fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng
@@ -517,7 +520,10 @@ struct PendingAuthApproval {
     redirect_uri: String,
     state: Option<String>,
     code_challenge: String,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "retained for Debug logging; the OAuth spec only defines S256 for us, but the field is kept so the pending-approval record round-trips exactly what the client sent"
+    )]
     code_challenge_method: String,
 }
 
@@ -621,7 +627,10 @@ impl<T: TokenStore, C: ClientStore, P: PasskeyStore> OAuthServer<T, C, P> {
 
 type IpRateLimiter = RateLimiter<String, DashMapStateStore<String>, DefaultClock>;
 
-#[allow(clippy::unwrap_used)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "requests_per_minute is validated as non-zero by OAuthConfigBuilder::build (ZeroRateLimit error), so NonZeroU32::new cannot return None here"
+)]
 fn create_rate_limiter(requests_per_minute: u32) -> Arc<IpRateLimiter> {
     let quota = Quota::per_minute(NonZeroU32::new(requests_per_minute).unwrap());
     Arc::new(RateLimiter::dashmap(quota))
@@ -743,7 +752,10 @@ pub fn build_oauth_router(protected_router: Router, config: OAuthConfig) -> Rout
 ///
 /// Panics if `config.server_url` is not a valid URL or has no host component,
 /// or if the `WebAuthn` builder fails (invalid RP configuration).
-#[allow(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "invalid server_url / WebAuthn RP config is a caller bug at startup, not a runtime condition; panicking surfaces it immediately rather than threading a Result through the public API"
+)]
 pub fn build_oauth_router_with_stores<T, C, P>(
     protected_router: Router,
     config: OAuthConfig,
@@ -866,7 +878,10 @@ async fn request_logging_middleware(req: axum::extract::Request, next: Next) -> 
 }
 
 // M5: Security headers middleware
-#[allow(clippy::unwrap_used)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "HeaderValue::from_static equivalents parsed from ASCII-only string literals cannot fail; any failure would be a compile-time bug in the literal"
+)]
 async fn security_headers_middleware(req: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
@@ -933,11 +948,20 @@ async fn authorization_server_metadata<T: TokenStore, C: ClientStore, P: Passkey
 struct RegisterClientRequest {
     client_name: Option<String>,
     redirect_uris: Vec<String>,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "deserialized per RFC 7591 but intentionally ignored: this server only issues authorization_code + refresh_token grants with client_secret_post auth, advertised via metadata"
+    )]
     grant_types: Option<Vec<String>>,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "deserialized per RFC 7591 but intentionally ignored: see grant_types above"
+    )]
     response_types: Option<Vec<String>>,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "deserialized per RFC 7591 but intentionally ignored: see grant_types above"
+    )]
     token_endpoint_auth_method: Option<String>,
 }
 
@@ -952,7 +976,6 @@ struct RegisterClientResponse {
     token_endpoint_auth_method: String,
 }
 
-#[allow(clippy::needless_pass_by_value)]
 async fn register_client<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     Json(body): Json<RegisterClientRequest>,
@@ -1035,15 +1058,17 @@ struct AuthorizeParams {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     scope: Option<String>,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "RFC 8707 Resource Indicator placeholder; tracked for issue #14 but not yet honoured"
+    )]
     resource: Option<String>,
 }
 
-#[allow(
+#[expect(
     clippy::similar_names,
-    clippy::cognitive_complexity,
-    clippy::needless_pass_by_value,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    reason = "`redirect_uri` (OAuth parameter) and `redirect_url` (parsed Url for redirect building) are distinct and canonically named; the authorize flow is linear and splitting it would obscure the check-then-issue logic"
 )]
 async fn authorize_get<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
@@ -1225,7 +1250,6 @@ struct ErrorResponse {
     error_description: Option<String>,
 }
 
-#[allow(clippy::needless_pass_by_value)]
 async fn token<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     Form(params): Form<TokenRequest>,
@@ -1268,7 +1292,6 @@ async fn token<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn handle_authorization_code<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     store: &OAuthServer<T, C, P>,
     client_id: &str,
@@ -1626,7 +1649,6 @@ async fn passkey_register_page<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     ))
 }
 
-#[allow(clippy::needless_pass_by_value)]
 async fn passkey_register_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyRegisterStartRequest>,
@@ -1721,7 +1743,6 @@ async fn passkey_register_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     }))
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
 async fn passkey_register_finish<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyRegisterFinishRequest>,
@@ -1824,7 +1845,6 @@ struct PasskeyAuthFinishResponse {
     redirect_url: String,
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
 async fn passkey_auth_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyAuthStartRequest>,
@@ -1929,7 +1949,6 @@ async fn passkey_auth_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     }))
 }
 
-#[allow(clippy::needless_pass_by_value)]
 async fn passkey_auth_finish<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     Json(body): Json<PasskeyAuthFinishRequest>,
@@ -2071,7 +2090,10 @@ struct RegisterTemplate<'a> {
     auto_start: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent OAuth/template field; collecting them into a struct would just move the same count to the struct literal at the call site"
+)]
 fn authorize_page(
     app_name: &str,
     client_id: &str,
@@ -2095,7 +2117,10 @@ fn authorize_page(
     // to prevent XSS via malicious parameter values.
     // In <script> tags, HTML entities are NOT decoded, so we use |safe in the template.
     // Only escape </ to prevent </script> injection.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "serde_json::to_string on a statically-constructed json! literal containing only &str values is infallible modulo OOM"
+    )]
     let params_json = serde_json::to_string(&serde_json::json!({
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -2148,7 +2173,10 @@ fn error_page(app_name: &str, message: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test module: invariants are established by the test fixtures themselves, so .unwrap() is idiomatic and a panic on violation is the desired test failure mode"
+)]
 mod tests {
     use super::*;
     use axum::routing::get as get_route;

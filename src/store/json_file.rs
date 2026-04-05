@@ -411,7 +411,10 @@ fn save_tokens(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test module: invariants are established by the test fixtures themselves, so .unwrap() is idiomatic and a panic on violation is the desired test failure mode"
+)]
 mod tests {
     use super::*;
     use crate::store::{ClientStore, PasskeyStore, TokenStore};
