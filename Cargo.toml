@@ -27,6 +27,7 @@ rand = "0.9"
 serde_urlencoded = "0.7"
 governor = "0.10"
 askama = "0.15"
+thiserror = "2"
 
 [lints.rust]
 unsafe_code = "forbid"

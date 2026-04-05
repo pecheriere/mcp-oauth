@@ -175,43 +175,29 @@ impl Default for CapacityConfig {
 }
 
 /// Errors that can occur when building an [`OAuthConfig`] via the builder.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum OAuthConfigError {
     /// `client_id` must not be empty.
+    #[error("client_id must not be empty")]
     EmptyClientId,
     /// `client_secret` must not be empty.
+    #[error("client_secret must not be empty")]
     EmptyClientSecret,
     /// `passkey_store_path` must not contain `..` components.
+    #[error("passkey_store_path must not contain '..' components")]
     PathTraversal,
     /// Rate limit values must be non-zero.
+    #[error("rate limit values must be non-zero")]
     ZeroRateLimit,
     /// At least one scope is required.
+    #[error("scopes must not be empty")]
     EmptyScopes,
     /// A capacity limit was set to zero. Use `None` on `max_registered_clients`
     /// for "unlimited"; all other capacity fields must be at least 1.
+    #[error("capacity limit must be at least 1 (use max_registered_clients: None for unlimited)")]
     ZeroCapacity,
 }
-
-impl std::fmt::Display for OAuthConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyClientId => write!(f, "client_id must not be empty"),
-            Self::EmptyClientSecret => write!(f, "client_secret must not be empty"),
-            Self::PathTraversal => {
-                write!(f, "passkey_store_path must not contain '..' components")
-            }
-            Self::ZeroRateLimit => write!(f, "rate limit values must be non-zero"),
-            Self::EmptyScopes => write!(f, "scopes must not be empty"),
-            Self::ZeroCapacity => write!(
-                f,
-                "capacity limit must be at least 1 (use max_registered_clients: None for unlimited)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for OAuthConfigError {}
 
 /// Returns the default allowed redirect URIs (Claude.ai callbacks).
 #[must_use]
