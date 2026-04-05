@@ -933,8 +933,16 @@ async fn authorization_server_metadata<T: TokenStore, C: ClientStore, P: Passkey
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
         "scopes_supported": store.config.scopes
     });
-    // Only advertise registration endpoint when no client has been registered yet
-    if client_count == 0 {
+    // Advertise the registration endpoint whenever it would accept a new
+    // registration: either the client cap is unlimited (`None`) or the store
+    // is still under the configured cap. This keeps RFC 7591 discovery
+    // consistent with the actual acceptance behaviour of `POST /register`.
+    let registration_open = store
+        .config
+        .capacity
+        .max_registered_clients
+        .is_none_or(|cap| client_count < cap);
+    if registration_open {
         metadata["registration_endpoint"] = serde_json::json!(format!("{url}/register"));
     }
     Json(metadata)
@@ -3141,6 +3149,112 @@ mod tests {
             body["scopes_supported"],
             serde_json::json!(["read", "write"])
         );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_advertises_registration_endpoint_under_cap() {
+        // Under a Some(2) cap with one client already registered, discovery
+        // via OAuth server metadata must still advertise /register so that
+        // RFC 7591 clients can bootstrap the second registration.
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .max_registered_clients(Some(2))
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        server
+            .post("/register")
+            .json(&serde_json::json!({
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]
+            }))
+            .await
+            .assert_status_ok();
+
+        let resp = server.get("/.well-known/oauth-authorization-server").await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["registration_endpoint"].is_string(),
+            "registration_endpoint should still be advertised when the cap permits more clients"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_hides_registration_endpoint_when_cap_reached() {
+        // Once the registered-client count hits the cap, the endpoint is no
+        // longer discoverable via metadata (mirrors the existing single-client
+        // lock behaviour but driven by the configurable cap).
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .max_registered_clients(Some(1))
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        server
+            .post("/register")
+            .json(&serde_json::json!({
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]
+            }))
+            .await
+            .assert_status_ok();
+
+        let resp = server.get("/.well-known/oauth-authorization-server").await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["registration_endpoint"].is_null(),
+            "registration_endpoint should be hidden once the cap is reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_always_advertises_registration_when_cap_is_none() {
+        // With max_registered_clients = None (unlimited), the endpoint stays
+        // advertised forever.
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .max_registered_clients(None)
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        for _ in 0..3 {
+            server
+                .post("/register")
+                .json(&serde_json::json!({
+                    "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]
+                }))
+                .await
+                .assert_status_ok();
+        }
+
+        let resp = server.get("/.well-known/oauth-authorization-server").await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(body["registration_endpoint"].is_string());
     }
 
     #[tokio::test]

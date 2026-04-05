@@ -253,16 +253,26 @@ impl ClientStore for JsonFileClientStore {
         id: String,
         client: RegisteredClient,
     ) -> Result<bool, StoreError> {
+        use std::collections::hash_map::Entry;
+
         let mut s = self.state.lock().await;
         if let Some(cap) = s.caps.max_registered_clients
             && s.registered_clients.len() >= cap
         {
             return Ok(false);
         }
-        s.registered_clients.insert(id, client);
-        s.persist()?;
-        drop(s);
-        Ok(true)
+        // Defensive: never clobber an existing client. Callers that supply
+        // their own id (custom stores, future handlers) must not be able to
+        // silently overwrite a registered client's secret or redirect URIs.
+        match s.registered_clients.entry(id) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(slot) => {
+                slot.insert(client);
+                s.persist()?;
+                drop(s);
+                Ok(true)
+            }
+        }
     }
 
     async fn get_client(&self, id: &str) -> Result<Option<RegisteredClient>, StoreError> {
@@ -746,6 +756,44 @@ mod tests {
             .unwrap();
         assert!(!ok, "third registration should be rejected by cap");
         assert_eq!(client_store.client_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_try_register_client_does_not_clobber_existing_id() {
+        // Defence-in-depth: even when under the cap, re-registering with an
+        // existing id must return Ok(false) and leave the original client
+        // intact. The real handler uses CSPRNG ids so collision is
+        // astronomically unlikely, but custom stores or future callers may
+        // pass known ids.
+        let dir = tempfile::tempdir().unwrap();
+        let caps = StoreCaps {
+            max_registered_clients: Some(5),
+            ..large_caps()
+        };
+        let (_, client_store, _) = create_json_file_stores(&dir.path().join("passkeys.json"), caps);
+
+        let ok = client_store
+            .try_register_client(
+                "dup".into(),
+                RegisteredClient::new("original-secret".into(), vec!["uri-1".into()]),
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+
+        let ok = client_store
+            .try_register_client(
+                "dup".into(),
+                RegisteredClient::new("attacker-secret".into(), vec!["uri-evil".into()]),
+            )
+            .await
+            .unwrap();
+        assert!(!ok, "duplicate id should be refused");
+
+        let existing = client_store.get_client("dup").await.unwrap().unwrap();
+        assert_eq!(existing.client_secret, "original-secret");
+        assert_eq!(existing.redirect_uris, vec!["uri-1"]);
+        assert_eq!(client_store.client_count().await.unwrap(), 1);
     }
 
     #[tokio::test]
