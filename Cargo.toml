@@ -1,6 +1,6 @@
 [package]
 name = "mcp-oauth"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Reusable OAuth 2.1 layer for MCP servers, compatible with Claude.ai"

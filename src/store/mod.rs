@@ -225,13 +225,18 @@ pub trait ClientStore: Send + Sync + 'static {
         client: RegisteredClient,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Atomically register a client only if no clients exist yet.
+    /// Atomically register a client if the store is under its configured
+    /// client cap.
     ///
-    /// Returns `Ok(true)` if the client was registered, `Ok(false)` if
-    /// a client already existed (registration locked).  Implementations
-    /// **must** check emptiness and insert under the same lock to prevent
-    /// TOCTOU races.
-    fn register_client_if_none(
+    /// Returns `Ok(true)` if the client was registered, `Ok(false)` if the
+    /// cap has been reached (registration locked). Implementations **must**
+    /// check the count and insert under the same lock to prevent TOCTOU
+    /// races.
+    ///
+    /// A cap of `Some(1)` (the default in [`crate::CapacityConfig`]) preserves
+    /// the historical single-client lock. `None` means unlimited dynamic
+    /// client registrations.
+    fn try_register_client(
         &self,
         id: String,
         client: RegisteredClient,

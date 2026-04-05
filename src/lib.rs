@@ -25,14 +25,18 @@
 //!
 //! let mcp_routes = Router::new(); // your protected MCP routes
 //!
-//! let config = OAuthConfig::with_defaults(
+//! // Using the builder (recommended):
+//! let config = OAuthConfig::builder(
 //!     "https://my-mcp.example.com".into(),
 //!     "my-client-id".into(),
 //!     "my-client-secret".into(),
 //!     "My MCP Server".into(),
 //!     PathBuf::from("passkeys.json"),
-//!     Some("initial-setup-token".into()),
-//! );
+//! )
+//! .setup_token("initial-setup-token")
+//! .add_redirect_uri("https://myapp.example.com/callback")
+//! .build()
+//! .expect("valid config");
 //!
 //! let (token_store, client_store, passkey_store) =
 //!     mcp_oauth::create_default_stores(&config);
@@ -109,6 +113,113 @@ fn generate_token() -> String {
 // Public config
 // ---------------------------------------------------------------------------
 
+/// Per-IP rate limiting configuration (requests per minute).
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Rate limit for auth-critical endpoints (`/token`, `/register`, `/passkey/*`).
+    /// Default: 10 req/min.
+    pub strict: u32,
+    /// Rate limit for public endpoints (`/.well-known/*`, `/authorize`, `/health`).
+    /// Default: 30 req/min.
+    pub moderate: u32,
+    /// Rate limit for protected (Bearer-authed) routes.
+    /// Default: 60 req/min.
+    pub lenient: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            strict: 10,
+            moderate: 30,
+            lenient: 60,
+        }
+    }
+}
+
+/// Capacity limits for in-memory transient state and persistent stores.
+#[derive(Debug, Clone)]
+pub struct CapacityConfig {
+    /// Max pending passkey registration sessions. Default: 10000.
+    pub max_registration_states: usize,
+    /// Max pending passkey authentication sessions. Default: 10000.
+    pub max_authentication_states: usize,
+    /// Max simultaneously stored access tokens. Default: 10000.
+    pub max_access_tokens: usize,
+    /// Max simultaneously stored refresh tokens. Default: 10000.
+    pub max_refresh_tokens: usize,
+    /// Max pending (unconsumed) authorization codes. Default: 10000.
+    pub max_auth_codes: usize,
+    /// Max dynamically registered OAuth clients.
+    ///
+    /// - `Some(n)` caps the store at `n` clients (default `Some(1)`: preserves
+    ///   the historical single-client registration lock).
+    /// - `None` allows unlimited dynamic client registrations.
+    pub max_registered_clients: Option<usize>,
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        Self {
+            max_registration_states: 10_000,
+            max_authentication_states: 10_000,
+            max_access_tokens: 10_000,
+            max_refresh_tokens: 10_000,
+            max_auth_codes: 10_000,
+            max_registered_clients: Some(1),
+        }
+    }
+}
+
+/// Errors that can occur when building an [`OAuthConfig`] via the builder.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OAuthConfigError {
+    /// `client_id` must not be empty.
+    EmptyClientId,
+    /// `client_secret` must not be empty.
+    EmptyClientSecret,
+    /// `passkey_store_path` must not contain `..` components.
+    PathTraversal,
+    /// Rate limit values must be non-zero.
+    ZeroRateLimit,
+    /// At least one scope is required.
+    EmptyScopes,
+    /// A capacity limit was set to zero. Use `None` on `max_registered_clients`
+    /// for "unlimited"; all other capacity fields must be at least 1.
+    ZeroCapacity,
+}
+
+impl std::fmt::Display for OAuthConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyClientId => write!(f, "client_id must not be empty"),
+            Self::EmptyClientSecret => write!(f, "client_secret must not be empty"),
+            Self::PathTraversal => {
+                write!(f, "passkey_store_path must not contain '..' components")
+            }
+            Self::ZeroRateLimit => write!(f, "rate limit values must be non-zero"),
+            Self::EmptyScopes => write!(f, "scopes must not be empty"),
+            Self::ZeroCapacity => write!(
+                f,
+                "capacity limit must be at least 1 (use max_registered_clients: None for unlimited)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OAuthConfigError {}
+
+/// Returns the default allowed redirect URIs (Claude.ai callbacks).
+#[must_use]
+pub fn default_redirect_uris() -> Vec<String> {
+    vec![
+        "https://claude.ai/api/mcp/auth_callback".to_owned(),
+        "https://claude.com/api/mcp/auth_callback".to_owned(),
+    ]
+}
+
+#[non_exhaustive]
 pub struct OAuthConfig {
     /// The public-facing URL of this server (e.g. `<https://my-mcp.fly.dev>`).
     pub server_url: String,
@@ -126,6 +237,16 @@ pub struct OAuthConfig {
     pub token_lifetime_secs: u64,
     /// Authorization code lifetime in seconds. Default: 300 (5 minutes).
     pub code_lifetime_secs: u64,
+    /// Redirect URIs that are always accepted (beyond per-client registered URIs).
+    /// Defaults to the Claude.ai callback URLs.
+    pub allowed_redirect_uris: Vec<String>,
+    /// Per-IP rate limiting tiers.
+    pub rate_limits: RateLimitConfig,
+    /// In-memory capacity limits for transient state.
+    pub capacity: CapacityConfig,
+    /// OAuth scopes supported and returned in token responses.
+    /// Defaults to `["mcp:tools"]`.
+    pub scopes: Vec<String>,
 }
 
 impl OAuthConfig {
@@ -163,7 +284,226 @@ impl OAuthConfig {
             setup_token,
             token_lifetime_secs: 86400,
             code_lifetime_secs: 300,
+            allowed_redirect_uris: default_redirect_uris(),
+            rate_limits: RateLimitConfig::default(),
+            capacity: CapacityConfig::default(),
+            scopes: vec!["mcp:tools".to_owned()],
         }
+    }
+
+    /// Create a builder for `OAuthConfig` with required parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mcp_oauth::OAuthConfig;
+    /// use std::path::PathBuf;
+    ///
+    /// let config = OAuthConfig::builder(
+    ///     "https://my-mcp.example.com".into(),
+    ///     "my-client-id".into(),
+    ///     "my-client-secret".into(),
+    ///     "My MCP Server".into(),
+    ///     PathBuf::from("passkeys.json"),
+    /// )
+    /// .setup_token("initial-setup-token")
+    /// .token_lifetime_secs(3600)
+    /// .add_redirect_uri("https://myapp.example.com/callback")
+    /// .build()
+    /// .expect("valid config");
+    /// ```
+    #[must_use]
+    pub fn builder(
+        server_url: String,
+        client_id: String,
+        client_secret: String,
+        app_name: String,
+        passkey_store_path: PathBuf,
+    ) -> OAuthConfigBuilder {
+        OAuthConfigBuilder {
+            server_url,
+            client_id,
+            client_secret,
+            app_name,
+            passkey_store_path,
+            setup_token: None,
+            token_lifetime_secs: 86400,
+            code_lifetime_secs: 300,
+            allowed_redirect_uris: default_redirect_uris(),
+            rate_limits: RateLimitConfig::default(),
+            capacity: CapacityConfig::default(),
+            scopes: vec!["mcp:tools".to_owned()],
+        }
+    }
+}
+
+/// Builder for [`OAuthConfig`].
+///
+/// Created via [`OAuthConfig::builder`]. Call [`.build()`](OAuthConfigBuilder::build)
+/// to validate and produce the final config.
+pub struct OAuthConfigBuilder {
+    server_url: String,
+    client_id: String,
+    client_secret: String,
+    app_name: String,
+    passkey_store_path: PathBuf,
+    setup_token: Option<String>,
+    token_lifetime_secs: u64,
+    code_lifetime_secs: u64,
+    allowed_redirect_uris: Vec<String>,
+    rate_limits: RateLimitConfig,
+    capacity: CapacityConfig,
+    scopes: Vec<String>,
+}
+
+impl OAuthConfigBuilder {
+    /// Set the one-time setup token for first passkey registration.
+    #[must_use]
+    pub fn setup_token(mut self, token: impl Into<String>) -> Self {
+        self.setup_token = Some(token.into());
+        self
+    }
+
+    /// Set access token lifetime in seconds (default: 86400 = 24 hours).
+    #[must_use]
+    pub const fn token_lifetime_secs(mut self, secs: u64) -> Self {
+        self.token_lifetime_secs = secs;
+        self
+    }
+
+    /// Set authorization code lifetime in seconds (default: 300 = 5 minutes).
+    #[must_use]
+    pub const fn code_lifetime_secs(mut self, secs: u64) -> Self {
+        self.code_lifetime_secs = secs;
+        self
+    }
+
+    /// Replace all allowed redirect URIs (overrides the default Claude.ai URIs).
+    #[must_use]
+    pub fn allowed_redirect_uris(mut self, uris: Vec<String>) -> Self {
+        self.allowed_redirect_uris = uris;
+        self
+    }
+
+    /// Add an additional allowed redirect URI (appends to defaults).
+    #[must_use]
+    pub fn add_redirect_uri(mut self, uri: impl Into<String>) -> Self {
+        self.allowed_redirect_uris.push(uri.into());
+        self
+    }
+
+    /// Set per-IP rate limiting configuration.
+    #[must_use]
+    pub const fn rate_limits(mut self, config: RateLimitConfig) -> Self {
+        self.rate_limits = config;
+        self
+    }
+
+    /// Set the full capacity configuration.
+    #[must_use]
+    pub const fn capacity(mut self, config: CapacityConfig) -> Self {
+        self.capacity = config;
+        self
+    }
+
+    /// Set the maximum number of simultaneously stored access tokens.
+    #[must_use]
+    pub const fn max_access_tokens(mut self, n: usize) -> Self {
+        self.capacity.max_access_tokens = n;
+        self
+    }
+
+    /// Set the maximum number of simultaneously stored refresh tokens.
+    #[must_use]
+    pub const fn max_refresh_tokens(mut self, n: usize) -> Self {
+        self.capacity.max_refresh_tokens = n;
+        self
+    }
+
+    /// Set the maximum number of pending authorization codes.
+    #[must_use]
+    pub const fn max_auth_codes(mut self, n: usize) -> Self {
+        self.capacity.max_auth_codes = n;
+        self
+    }
+
+    /// Set the cap on dynamically registered clients.
+    ///
+    /// Pass `None` for unlimited registrations, or `Some(n)` to cap the store
+    /// at `n` clients. The default is `Some(1)`, which preserves the
+    /// historical single-client registration lock.
+    #[must_use]
+    pub const fn max_registered_clients(mut self, n: Option<usize>) -> Self {
+        self.capacity.max_registered_clients = n;
+        self
+    }
+
+    /// Replace all supported OAuth scopes (overrides the default `["mcp:tools"]`).
+    #[must_use]
+    pub fn scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
+        self
+    }
+
+    /// Add an additional OAuth scope (appends to defaults).
+    #[must_use]
+    pub fn add_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scopes.push(scope.into());
+        self
+    }
+
+    /// Validate and build the [`OAuthConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OAuthConfigError`] if validation fails.
+    pub fn build(self) -> Result<OAuthConfig, OAuthConfigError> {
+        if self.client_id.is_empty() {
+            return Err(OAuthConfigError::EmptyClientId);
+        }
+        if self.client_secret.is_empty() {
+            return Err(OAuthConfigError::EmptyClientSecret);
+        }
+        if self
+            .passkey_store_path
+            .components()
+            .any(|c| c == Component::ParentDir)
+        {
+            return Err(OAuthConfigError::PathTraversal);
+        }
+        if self.rate_limits.strict == 0
+            || self.rate_limits.moderate == 0
+            || self.rate_limits.lenient == 0
+        {
+            return Err(OAuthConfigError::ZeroRateLimit);
+        }
+        if self.scopes.is_empty() {
+            return Err(OAuthConfigError::EmptyScopes);
+        }
+        if self.capacity.max_access_tokens == 0
+            || self.capacity.max_refresh_tokens == 0
+            || self.capacity.max_auth_codes == 0
+            || self.capacity.max_registration_states == 0
+            || self.capacity.max_authentication_states == 0
+            || self.capacity.max_registered_clients == Some(0)
+        {
+            return Err(OAuthConfigError::ZeroCapacity);
+        }
+
+        Ok(OAuthConfig {
+            server_url: self.server_url,
+            client_id: self.client_id,
+            client_secret: self.client_secret,
+            app_name: self.app_name,
+            passkey_store_path: self.passkey_store_path,
+            setup_token: self.setup_token,
+            token_lifetime_secs: self.token_lifetime_secs,
+            code_lifetime_secs: self.code_lifetime_secs,
+            allowed_redirect_uris: self.allowed_redirect_uris,
+            rate_limits: self.rate_limits,
+            capacity: self.capacity,
+            scopes: self.scopes,
+        })
     }
 }
 
@@ -181,9 +521,7 @@ struct PendingAuthApproval {
     code_challenge_method: String,
 }
 
-// H2: Capacity limits to prevent memory exhaustion DoS
-const MAX_REGISTRATION_STATES: usize = 10_000;
-const MAX_AUTHENTICATION_STATES: usize = 10_000;
+// H2: Capacity limits now configurable via OAuthConfig.capacity
 use store::TRANSIENT_STATE_TTL_SECS;
 
 struct OAuthServer<T: TokenStore, C: ClientStore, P: PasskeyStore> {
@@ -201,10 +539,7 @@ struct OAuthServer<T: TokenStore, C: ClientStore, P: PasskeyStore> {
     auth_session_token: Mutex<Option<(String, u64)>>, // (token, created_at_epoch)
 }
 
-const ALLOWED_REDIRECT_URIS: &[&str] = &[
-    "https://claude.ai/api/mcp/auth_callback",
-    "https://claude.com/api/mcp/auth_callback",
-];
+// Allowed redirect URIs now configurable via OAuthConfig.allowed_redirect_uris
 
 type AppState<T, C, P> = Arc<OAuthServer<T, C, P>>;
 
@@ -238,7 +573,12 @@ impl<T: TokenStore, C: ClientStore, P: PasskeyStore> OAuthServer<T, C, P> {
     }
 
     async fn is_redirect_uri_allowed(&self, client_id: &str, redirect_uri: &str) -> bool {
-        if ALLOWED_REDIRECT_URIS.contains(&redirect_uri) {
+        if self
+            .config
+            .allowed_redirect_uris
+            .iter()
+            .any(|u| u == redirect_uri)
+        {
             return true;
         }
         match self.client_store.get_client(client_id).await {
@@ -343,8 +683,14 @@ async fn rate_limit_middleware(
 pub fn create_default_stores(
     config: &OAuthConfig,
 ) -> (impl TokenStore, impl ClientStore, impl PasskeyStore) {
+    let caps = store::json_file::StoreCaps {
+        max_access_tokens: config.capacity.max_access_tokens,
+        max_refresh_tokens: config.capacity.max_refresh_tokens,
+        max_auth_codes: config.capacity.max_auth_codes,
+        max_registered_clients: config.capacity.max_registered_clients,
+    };
     let (token_store, client_store, summary) =
-        store::json_file::create_json_file_stores(&config.passkey_store_path);
+        store::json_file::create_json_file_stores(&config.passkey_store_path, caps);
 
     tracing::info!(
         "OAuth store loaded: {} access_tokens, {} refresh_tokens, {} registered_clients from {:?}",
@@ -438,9 +784,9 @@ where
         auth_session_token: Mutex::new(None),
     });
 
-    let strict_limiter = create_rate_limiter(10);
-    let moderate_limiter = create_rate_limiter(30);
-    let lenient_limiter = create_rate_limiter(60);
+    let strict_limiter = create_rate_limiter(store.config.rate_limits.strict);
+    let moderate_limiter = create_rate_limiter(store.config.rate_limits.moderate);
+    let lenient_limiter = create_rate_limiter(store.config.rate_limits.lenient);
 
     // Auth routes: strict rate limiting (10 req/min per IP)
     let auth_routes = Router::new()
@@ -570,7 +916,7 @@ async fn authorization_server_metadata<T: TokenStore, C: ClientStore, P: Passkey
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
-        "scopes_supported": ["mcp:tools"]
+        "scopes_supported": store.config.scopes
     });
     // Only advertise registration endpoint when no client has been registered yet
     if client_count == 0 {
@@ -612,7 +958,7 @@ async fn register_client<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     Json(body): Json<RegisterClientRequest>,
 ) -> Result<Json<RegisterClientResponse>, (StatusCode, Json<ErrorResponse>)> {
     for uri in &body.redirect_uris {
-        if !ALLOWED_REDIRECT_URIS.contains(&uri.as_str()) {
+        if !store.config.allowed_redirect_uris.iter().any(|u| u == uri) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -642,7 +988,7 @@ async fn register_client<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     // concurrent registration requests.
     let registered = store
         .client_store
-        .register_client_if_none(
+        .try_register_client(
             client_id.clone(),
             RegisteredClient {
                 client_secret: client_secret.clone(),
@@ -658,7 +1004,7 @@ async fn register_client<T: TokenStore, C: ClientStore, P: PasskeyStore>(
             Json(ErrorResponse {
                 error: "registration_locked".into(),
                 error_description: Some(
-                    "Client registration is locked. A client already exists. Delete tokens.json and restart to reset."
+                    "Client registration is locked: the configured max_registered_clients cap has been reached."
                         .into(),
                 ),
             }),
@@ -1036,7 +1382,7 @@ async fn handle_authorization_code<T: TokenStore, C: ClientStore, P: PasskeyStor
         token_type: "Bearer".into(),
         expires_in: store.config.token_lifetime_secs,
         refresh_token,
-        scope: "mcp:tools".into(),
+        scope: store.config.scopes.join(" "),
     }))
 }
 
@@ -1139,7 +1485,7 @@ async fn handle_refresh_token<T: TokenStore, C: ClientStore, P: PasskeyStore>(
         token_type: "Bearer".into(),
         expires_in: store.config.token_lifetime_secs,
         refresh_token: new_refresh_token,
-        scope: "mcp:tools".into(),
+        scope: store.config.scopes.join(" "),
     }))
 }
 
@@ -1357,7 +1703,7 @@ async fn passkey_register_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
         states.retain(|_, (_, created_at)| {
             now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS
         });
-        if states.len() >= MAX_REGISTRATION_STATES {
+        if states.len() >= store.config.capacity.max_registration_states {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(ErrorResponse {
@@ -1565,7 +1911,7 @@ async fn passkey_auth_start<T: TokenStore, C: ClientStore, P: PasskeyStore>(
         states.retain(|_, (_, _, created_at)| {
             now.saturating_sub(*created_at) <= TRANSIENT_STATE_TTL_SECS
         });
-        if states.len() >= MAX_AUTHENTICATION_STATES {
+        if states.len() >= store.config.capacity.max_authentication_states {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(ErrorResponse {
@@ -1820,8 +2166,11 @@ mod tests {
     }
 
     fn build_test_app(dir: &std::path::Path) -> Router {
+        build_test_app_with_config(test_config(dir))
+    }
+
+    fn build_test_app_with_config(config: OAuthConfig) -> Router {
         let protected = Router::new().route("/mcp", get_route(|| async { "protected content" }));
-        let config = test_config(dir);
         let (token_store, client_store, passkey_store) = create_default_stores(&config);
         build_oauth_router_with_stores(protected, config, token_store, client_store, passkey_store)
     }
@@ -1949,6 +2298,299 @@ mod tests {
             "App".into(),
             PathBuf::from("/data/../etc/passkeys.json"),
             None,
+        );
+    }
+
+    // -- Builder tests --
+
+    #[test]
+    fn test_builder_defaults_match_with_defaults() {
+        let from_defaults = OAuthConfig::with_defaults(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+            None,
+        );
+        let from_builder = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            from_defaults.token_lifetime_secs,
+            from_builder.token_lifetime_secs
+        );
+        assert_eq!(
+            from_defaults.code_lifetime_secs,
+            from_builder.code_lifetime_secs
+        );
+        assert_eq!(
+            from_defaults.allowed_redirect_uris,
+            from_builder.allowed_redirect_uris
+        );
+        assert_eq!(
+            from_defaults.rate_limits.strict,
+            from_builder.rate_limits.strict
+        );
+        assert_eq!(
+            from_defaults.rate_limits.moderate,
+            from_builder.rate_limits.moderate
+        );
+        assert_eq!(
+            from_defaults.rate_limits.lenient,
+            from_builder.rate_limits.lenient
+        );
+        assert_eq!(
+            from_defaults.capacity.max_registration_states,
+            from_builder.capacity.max_registration_states
+        );
+        assert_eq!(
+            from_defaults.capacity.max_authentication_states,
+            from_builder.capacity.max_authentication_states
+        );
+        assert_eq!(
+            from_defaults.capacity.max_access_tokens,
+            from_builder.capacity.max_access_tokens
+        );
+        assert_eq!(
+            from_defaults.capacity.max_refresh_tokens,
+            from_builder.capacity.max_refresh_tokens
+        );
+        assert_eq!(
+            from_defaults.capacity.max_auth_codes,
+            from_builder.capacity.max_auth_codes
+        );
+        assert_eq!(
+            from_defaults.capacity.max_registered_clients,
+            from_builder.capacity.max_registered_clients
+        );
+        assert_eq!(from_defaults.scopes, from_builder.scopes);
+    }
+
+    #[test]
+    fn test_builder_empty_client_id_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            String::new(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::EmptyClientId)));
+    }
+
+    #[test]
+    fn test_builder_empty_client_secret_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            String::new(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::EmptyClientSecret)));
+    }
+
+    #[test]
+    fn test_builder_path_traversal_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("/data/../etc/passkeys.json"),
+        )
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::PathTraversal)));
+    }
+
+    #[test]
+    fn test_builder_zero_rate_limit_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .rate_limits(RateLimitConfig {
+            strict: 0,
+            moderate: 30,
+            lenient: 60,
+        })
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::ZeroRateLimit)));
+    }
+
+    #[test]
+    fn test_builder_empty_scopes_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .scopes(vec![])
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::EmptyScopes)));
+    }
+
+    #[test]
+    fn test_builder_custom_redirect_uris_replaces() {
+        let cfg = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .allowed_redirect_uris(vec!["https://custom.example.com/cb".to_owned()])
+        .build()
+        .unwrap();
+        assert_eq!(
+            cfg.allowed_redirect_uris,
+            vec!["https://custom.example.com/cb"]
+        );
+    }
+
+    #[test]
+    fn test_builder_add_redirect_uri_appends() {
+        let cfg = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .add_redirect_uri("https://custom.example.com/cb")
+        .build()
+        .unwrap();
+        assert_eq!(
+            cfg.allowed_redirect_uris.len(),
+            default_redirect_uris().len() + 1
+        );
+        assert!(
+            cfg.allowed_redirect_uris
+                .contains(&"https://claude.ai/api/mcp/auth_callback".to_owned())
+        );
+        assert!(
+            cfg.allowed_redirect_uris
+                .contains(&"https://custom.example.com/cb".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_builder_custom_scopes() {
+        let cfg = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .scopes(vec!["read".to_owned(), "write".to_owned()])
+        .build()
+        .unwrap();
+        assert_eq!(cfg.scopes, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn test_builder_add_scope_appends() {
+        let cfg = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .add_scope("admin")
+        .build()
+        .unwrap();
+        assert_eq!(cfg.scopes, vec!["mcp:tools", "admin"]);
+    }
+
+    #[test]
+    fn test_builder_zero_max_access_tokens_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .max_access_tokens(0)
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::ZeroCapacity)));
+    }
+
+    #[test]
+    fn test_builder_some_zero_max_registered_clients_fails() {
+        let result = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .max_registered_clients(Some(0))
+        .build();
+        assert!(matches!(result, Err(OAuthConfigError::ZeroCapacity)));
+    }
+
+    #[test]
+    fn test_builder_none_max_registered_clients_allowed() {
+        let cfg = OAuthConfig::builder(
+            "https://example.com".into(),
+            "id".into(),
+            "secret".into(),
+            "App".into(),
+            PathBuf::from("pk.json"),
+        )
+        .max_registered_clients(None)
+        .build()
+        .unwrap();
+        assert_eq!(cfg.capacity.max_registered_clients, None);
+    }
+
+    #[test]
+    fn test_oauth_config_error_display_all_variants() {
+        // Each variant's Display output must contain a recognisable substring
+        // so error messages remain useful in logs/telemetry.
+        assert!(
+            OAuthConfigError::EmptyClientId
+                .to_string()
+                .contains("client_id")
+        );
+        assert!(
+            OAuthConfigError::EmptyClientSecret
+                .to_string()
+                .contains("client_secret")
+        );
+        assert!(
+            OAuthConfigError::PathTraversal
+                .to_string()
+                .contains("passkey_store_path")
+        );
+        assert!(
+            OAuthConfigError::ZeroRateLimit
+                .to_string()
+                .contains("rate limit")
+        );
+        assert!(OAuthConfigError::EmptyScopes.to_string().contains("scopes"));
+        assert!(
+            OAuthConfigError::ZeroCapacity
+                .to_string()
+                .contains("capacity")
         );
     }
 
@@ -2333,10 +2975,16 @@ mod tests {
 
     #[test]
     fn test_load_tokens_missing_file() {
-        // Use the passkey store constructor with a non-existent path
-        let (_, _, summary) = store::json_file::create_json_file_stores(std::path::Path::new(
-            "/nonexistent/passkeys.json",
-        ));
+        let caps = store::json_file::StoreCaps {
+            max_access_tokens: 10,
+            max_refresh_tokens: 10,
+            max_auth_codes: 10,
+            max_registered_clients: Some(1),
+        };
+        let (_, _, summary) = store::json_file::create_json_file_stores(
+            std::path::Path::new("/nonexistent/passkeys.json"),
+            caps,
+        );
         assert_eq!(summary.access_tokens, 0);
         assert_eq!(summary.refresh_tokens, 0);
         assert_eq!(summary.registered_clients, 0);
@@ -2388,5 +3036,121 @@ mod tests {
         let html = register_page("App", false, Some("tok123"));
         assert!(html.contains("App"));
         assert!(html.contains("tok123"));
+    }
+
+    // -- Builder integration tests --
+
+    #[tokio::test]
+    async fn test_custom_redirect_uri_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .add_redirect_uri("https://custom.example.com/callback")
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        let resp = server
+            .post("/register")
+            .json(&serde_json::json!({
+                "redirect_uris": ["https://custom.example.com/callback"]
+            }))
+            .await;
+        resp.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_default_redirect_uri_rejected_when_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .allowed_redirect_uris(vec!["https://custom.example.com/callback".to_owned()])
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        let resp = server
+            .post("/register")
+            .json(&serde_json::json!({
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]
+            }))
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_custom_scope_in_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .scopes(vec!["read".to_owned(), "write".to_owned()])
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        let resp = server.get("/.well-known/oauth-authorization-server").await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["scopes_supported"],
+            serde_json::json!(["read", "write"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_client_cap_of_two_accepts_two_then_rejects() {
+        // Configure a 2-client cap and verify the first two registrations
+        // succeed while the third is rejected with `registration_locked`.
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig::builder(
+            "https://mcp.example.com".into(),
+            "test-client-id".into(),
+            "test-client-secret".into(),
+            "Test App".into(),
+            dir.path().join("passkeys.json"),
+        )
+        .setup_token("setup-token-123")
+        .max_registered_clients(Some(2))
+        .build()
+        .unwrap();
+        let server = TestServer::new(build_test_app_with_config(config));
+
+        for _ in 0..2 {
+            let resp = server
+                .post("/register")
+                .json(&serde_json::json!({
+                    "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]
+                }))
+                .await;
+            resp.assert_status_ok();
+        }
+
+        let resp = server
+            .post("/register")
+            .json(&serde_json::json!({
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]
+            }))
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["error"], "registration_locked");
     }
 }

@@ -19,12 +19,25 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
-// Capacity limits (match the original constants)
+// Capacity limits (caller-provided via StoreCaps)
 // ---------------------------------------------------------------------------
 
-const MAX_AUTH_CODES: usize = 10_000;
-const MAX_ACCESS_TOKENS: usize = 10_000;
-const MAX_REFRESH_TOKENS: usize = 10_000;
+/// Capacity limits injected into the JSON-file stores at construction.
+///
+/// Mirrors the relevant fields from [`crate::CapacityConfig`]; kept as a
+/// separate crate-private type so `create_json_file_stores` has a stable
+/// signature independent of future additions to the public config.
+#[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "`max_` prefix carries meaning (cap semantics) and mirrors field names on the public CapacityConfig"
+)]
+pub(crate) struct StoreCaps {
+    pub(crate) max_access_tokens: usize,
+    pub(crate) max_refresh_tokens: usize,
+    pub(crate) max_auth_codes: usize,
+    pub(crate) max_registered_clients: Option<usize>,
+}
 
 use super::TRANSIENT_STATE_TTL_SECS;
 
@@ -46,6 +59,7 @@ struct SharedState {
     /// Auth codes are *not* persisted (short TTL, in-memory only).
     auth_codes: HashMap<String, AuthCode>,
     tokens_path: PathBuf,
+    caps: StoreCaps,
 }
 
 impl SharedState {
@@ -67,11 +81,12 @@ impl SharedState {
 /// Create the default JSON-file-backed token and client stores.
 ///
 /// Both stores share the same underlying state so that persistence
-/// (to `tokens.json`) remains atomic.  Returns `(token_store, client_store)`
+/// (to `tokens.json`) remains atomic. Returns `(token_store, client_store)`
 /// plus a summary of what was loaded for logging.
 #[must_use]
 pub(crate) fn create_json_file_stores(
     passkey_store_path: &Path,
+    caps: StoreCaps,
 ) -> (impl TokenStore, impl ClientStore, StoreSummary) {
     let tp = tokens_path(passkey_store_path);
     let persisted = load_tokens(&tp);
@@ -89,6 +104,7 @@ pub(crate) fn create_json_file_stores(
         registered_clients: persisted.registered_clients,
         auth_codes: HashMap::new(),
         tokens_path: tp,
+        caps,
     }));
 
     let token_store = JsonFileTokenStore {
@@ -123,7 +139,7 @@ impl TokenStore for JsonFileTokenStore {
         let now = crate::now_epoch();
         s.auth_codes
             .retain(|_, v| now.saturating_sub(v.created_at) <= TRANSIENT_STATE_TTL_SECS);
-        if s.auth_codes.len() >= MAX_AUTH_CODES {
+        if s.auth_codes.len() >= s.caps.max_auth_codes {
             return Err(StoreError::CapacityExceeded);
         }
         s.auth_codes.insert(code, entry);
@@ -146,7 +162,7 @@ impl TokenStore for JsonFileTokenStore {
         let now = crate::now_epoch();
         s.access_tokens
             .retain(|_, v| now.saturating_sub(v.created_at) < v.expires_in_secs);
-        if s.access_tokens.len() >= MAX_ACCESS_TOKENS {
+        if s.access_tokens.len() >= s.caps.max_access_tokens {
             return Err(StoreError::CapacityExceeded);
         }
         s.access_tokens.insert(token, entry);
@@ -171,7 +187,7 @@ impl TokenStore for JsonFileTokenStore {
         entry: RefreshTokenEntry,
     ) -> Result<(), StoreError> {
         let mut s = self.state.lock().await;
-        if s.refresh_tokens.len() >= MAX_REFRESH_TOKENS {
+        if s.refresh_tokens.len() >= s.caps.max_refresh_tokens {
             return Err(StoreError::CapacityExceeded);
         }
         s.refresh_tokens.insert(token, entry);
@@ -232,13 +248,15 @@ impl ClientStore for JsonFileClientStore {
         s.persist()
     }
 
-    async fn register_client_if_none(
+    async fn try_register_client(
         &self,
         id: String,
         client: RegisteredClient,
     ) -> Result<bool, StoreError> {
         let mut s = self.state.lock().await;
-        if !s.registered_clients.is_empty() {
+        if let Some(cap) = s.caps.max_registered_clients
+            && s.registered_clients.len() >= cap
+        {
             return Ok(false);
         }
         s.registered_clients.insert(id, client);
@@ -398,12 +416,23 @@ mod tests {
     use super::*;
     use crate::store::{ClientStore, PasskeyStore, TokenStore};
 
+    /// Generous caps for tests that don't care about capacity enforcement.
+    fn large_caps() -> StoreCaps {
+        StoreCaps {
+            max_access_tokens: 10_000,
+            max_refresh_tokens: 10_000,
+            max_auth_codes: 10_000,
+            max_registered_clients: Some(1),
+        }
+    }
+
     // -- TokenStore tests --
 
     #[tokio::test]
     async fn test_store_and_consume_auth_code() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (store, _, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
         let code = AuthCode::new("cid".into(), "uri".into(), "ch".into(), 1000);
         store.store_auth_code("code1".into(), code).await.unwrap();
@@ -421,7 +450,8 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_get_access_token() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (store, _, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
         let entry = AccessTokenEntry::new("cid".into(), 1000, 3600, "rt1".into());
         store.store_access_token("at1".into(), entry).await.unwrap();
@@ -440,7 +470,8 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_consume_refresh_token() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (store, _, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
         let entry = RefreshTokenEntry::new("cid".into());
         store
@@ -464,7 +495,8 @@ mod tests {
     #[tokio::test]
     async fn test_revoke_access_tokens_by_refresh() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (store, _, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
         // Store two access tokens with different refresh tokens
         let now = crate::now_epoch();
@@ -494,7 +526,8 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_expired_tokens() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (store, _, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
         let now = crate::now_epoch();
         // Expired token (created 10000s ago, expires in 3600s)
@@ -523,11 +556,14 @@ mod tests {
     #[tokio::test]
     async fn test_auth_code_capacity_exceeded() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let caps = StoreCaps {
+            max_auth_codes: 3,
+            ..large_caps()
+        };
+        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"), caps);
 
         let now = crate::now_epoch();
-        // Fill to capacity
-        for i in 0..MAX_AUTH_CODES {
+        for i in 0..3 {
             store
                 .store_auth_code(
                     format!("code-{i}"),
@@ -537,12 +573,62 @@ mod tests {
                 .unwrap();
         }
 
-        // Next insert should fail
         let result = store
             .store_auth_code(
                 "overflow".into(),
                 AuthCode::new("cid".into(), "uri".into(), "ch".into(), now),
             )
+            .await;
+        assert!(matches!(result, Err(StoreError::CapacityExceeded)));
+    }
+
+    #[tokio::test]
+    async fn test_access_token_capacity_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let caps = StoreCaps {
+            max_access_tokens: 3,
+            ..large_caps()
+        };
+        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"), caps);
+
+        let now = crate::now_epoch();
+        for i in 0..3 {
+            store
+                .store_access_token(
+                    format!("at-{i}"),
+                    AccessTokenEntry::new("cid".into(), now, 3600, format!("rt-{i}")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let result = store
+            .store_access_token(
+                "overflow".into(),
+                AccessTokenEntry::new("cid".into(), now, 3600, "rt-overflow".into()),
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::CapacityExceeded)));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_capacity_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let caps = StoreCaps {
+            max_refresh_tokens: 3,
+            ..large_caps()
+        };
+        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"), caps);
+
+        for i in 0..3 {
+            store
+                .store_refresh_token(format!("rt-{i}"), RefreshTokenEntry::new("cid".into()))
+                .await
+                .unwrap();
+        }
+
+        let result = store
+            .store_refresh_token("overflow".into(), RefreshTokenEntry::new("cid".into()))
             .await;
         assert!(matches!(result, Err(StoreError::CapacityExceeded)));
     }
@@ -554,7 +640,8 @@ mod tests {
 
         // Store tokens and a client
         {
-            let (token_store, client_store, _) = create_json_file_stores(&passkey_path);
+            let (token_store, client_store, _) =
+                create_json_file_stores(&passkey_path, large_caps());
             let now = crate::now_epoch();
             token_store
                 .store_access_token(
@@ -577,7 +664,8 @@ mod tests {
         }
 
         // Reload from same path
-        let (token_store, client_store, summary) = create_json_file_stores(&passkey_path);
+        let (token_store, client_store, summary) =
+            create_json_file_stores(&passkey_path, large_caps());
         assert_eq!(summary.access_tokens, 1);
         assert_eq!(summary.refresh_tokens, 1);
         assert_eq!(summary.registered_clients, 1);
@@ -597,28 +685,86 @@ mod tests {
     // -- ClientStore tests --
 
     #[tokio::test]
-    async fn test_client_register_if_none_atomic() {
+    async fn test_try_register_client_default_single_client_cap() {
+        // Default cap is Some(1) — the historical single-client lock.
         let dir = tempfile::tempdir().unwrap();
-        let (_, client_store, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (_, client_store, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
-        let client = RegisteredClient::new("secret1".into(), vec!["uri".into()]);
-        let result = client_store
-            .register_client_if_none("c1".into(), client)
+        let ok = client_store
+            .try_register_client(
+                "c1".into(),
+                RegisteredClient::new("secret1".into(), vec!["uri".into()]),
+            )
             .await
             .unwrap();
-        assert!(result); // first registration succeeds
+        assert!(ok);
 
-        let client = RegisteredClient::new("secret2".into(), vec!["uri".into()]);
-        let result = client_store
-            .register_client_if_none("c2".into(), client)
+        let ok = client_store
+            .try_register_client(
+                "c2".into(),
+                RegisteredClient::new("secret2".into(), vec!["uri".into()]),
+            )
             .await
             .unwrap();
-        assert!(!result); // second is rejected (a client already exists)
+        assert!(!ok);
 
-        // Only the first client should exist
         assert!(client_store.get_client("c1").await.unwrap().is_some());
         assert!(client_store.get_client("c2").await.unwrap().is_none());
         assert_eq!(client_store.client_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_try_register_client_respects_configurable_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let caps = StoreCaps {
+            max_registered_clients: Some(2),
+            ..large_caps()
+        };
+        let (_, client_store, _) = create_json_file_stores(&dir.path().join("passkeys.json"), caps);
+
+        for i in 0..2 {
+            let ok = client_store
+                .try_register_client(
+                    format!("c{i}"),
+                    RegisteredClient::new(format!("s{i}"), vec!["uri".into()]),
+                )
+                .await
+                .unwrap();
+            assert!(ok, "registration {i} should succeed");
+        }
+
+        let ok = client_store
+            .try_register_client(
+                "c2".into(),
+                RegisteredClient::new("s2".into(), vec!["uri".into()]),
+            )
+            .await
+            .unwrap();
+        assert!(!ok, "third registration should be rejected by cap");
+        assert_eq!(client_store.client_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_try_register_client_unlimited_when_cap_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let caps = StoreCaps {
+            max_registered_clients: None,
+            ..large_caps()
+        };
+        let (_, client_store, _) = create_json_file_stores(&dir.path().join("passkeys.json"), caps);
+
+        for i in 0..5 {
+            let ok = client_store
+                .try_register_client(
+                    format!("c{i}"),
+                    RegisteredClient::new(format!("s{i}"), vec!["uri".into()]),
+                )
+                .await
+                .unwrap();
+            assert!(ok, "registration {i} should succeed with unlimited cap");
+        }
+        assert_eq!(client_store.client_count().await.unwrap(), 5);
     }
 
     #[tokio::test]
@@ -627,7 +773,7 @@ mod tests {
         let passkey_path = dir.path().join("passkeys.json");
 
         {
-            let (_, client_store, _) = create_json_file_stores(&passkey_path);
+            let (_, client_store, _) = create_json_file_stores(&passkey_path, large_caps());
             client_store
                 .register_client(
                     "c1".into(),
@@ -637,7 +783,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (_, client_store, _) = create_json_file_stores(&passkey_path);
+        let (_, client_store, _) = create_json_file_stores(&passkey_path, large_caps());
         let client = client_store.get_client("c1").await.unwrap();
         assert!(client.is_some());
         assert_eq!(client.unwrap().redirect_uris, vec!["u"]);
@@ -648,7 +794,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_refresh_token_does_not_consume() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, _, _) = create_json_file_stores(&dir.path().join("passkeys.json"));
+        let (store, _, _) =
+            create_json_file_stores(&dir.path().join("passkeys.json"), large_caps());
 
         store
             .store_refresh_token("rt1".into(), RefreshTokenEntry::new("cid".into()))
