@@ -12,6 +12,12 @@ env:
 
 jobs:
   ci:
+    # Reusable workflow: the caller's job-level permissions are the ceiling
+    # for every job inside ci.yml. Without this block, the top-level
+    # `permissions: {}` propagates as "contents: none" and ci.yml fails at
+    # startup because every inner job requests `contents: read`.
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yml
 
   publish:
