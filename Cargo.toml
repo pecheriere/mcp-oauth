@@ -41,7 +41,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [dev-dependencies]
-axum-test = "19.1.1"
+axum-test = "20.0.0"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5.3"
