@@ -22,6 +22,9 @@ This crate handles security-sensitive operations including:
 
 ## Supported Versions
 
+Only the latest release receives security fixes.
+
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 0.3.x   | Yes       |
+| < 0.3   | No        |

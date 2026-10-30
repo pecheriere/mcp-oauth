@@ -4,61 +4,58 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs these checks on the tagged commit first.
   workflow_call:
 
-permissions: {}
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    permissions:
-      contents: read
+  lint-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test
-
-  clippy:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
-
-  fmt:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
         with:
-          components: rustfmt
-      - run: cargo fmt --check
-
-  audit:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2.0.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - name: Build the documentation
+        run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          arguments: --all-features --locked
+          command: check
 
-  deny:
-    permissions:
-      contents: read
+  crate-age:
+    # Compares Cargo.lock with the PR's base, so it only runs on pull requests.
+    # Nothing stops a push straight to main from skipping it, so the release
+    # workflow runs the same check against the previous release tag before it
+    # publishes anything.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR's merge commit and its first parent, the base it merges into.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Lint and test the CI scripts
+        run: |
+          python3 -m venv "$RUNNER_TEMP/lint"
+          "$RUNNER_TEMP/lint/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r .github/requirements-lint.txt
+          "$RUNNER_TEMP/lint/bin/ruff" check .github/scripts
+          "$RUNNER_TEMP/lint/bin/ruff" format --check .github/scripts
+          python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Refuse crate versions published less than 14 days ago
+        run: python3 -I .github/scripts/crate_age.py --base HEAD^1

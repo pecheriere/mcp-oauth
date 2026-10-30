@@ -16,6 +16,20 @@ cargo clippy         # lint (strict: all=deny, pedantic=warn, unsafe_code=forbid
 cargo doc --no-deps  # generate API docs
 ```
 
+CI (`.github/workflows/ci.yml` and `zizmor.yml`) runs these, and every one must pass:
+
+```bash
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+cargo deny --all-features --locked check
+python3 -I .github/scripts/crate_age.py --base main
+uvx zizmor@1.31.1 .   # when a workflow or the Dependabot config changes
+```
+
+The toolchain is pinned in `rust-toolchain.toml`.
+
 ## Architecture
 
 Source is split across `src/lib.rs` (handlers, router, config) and `src/store/` (storage traits and implementations). HTML templates are in `templates/`.
@@ -50,11 +64,14 @@ Source is split across `src/lib.rs` (handlers, router, config) and `src/store/` 
 - Constant-time secret comparison via `subtle`
 - PKCE S256 enforced, no plain
 - Per-IP rate limiting via `governor`
-- Supply-chain auditing via `cargo-deny` and `cargo-audit`
+- Supply-chain auditing via `cargo-deny` (pull requests and nightly)
 
 ## Dependencies
 
 Key crates: `axum` (HTTP), `tokio` (async), `webauthn-rs` (passkeys), `governor` (rate limiting), `sha2`/`subtle` (crypto), `askama` (templates).
+
+- A crate version must have been published at least 14 days before it lands in `Cargo.lock`, except the oldest release that fixes a RUSTSEC advisory, listed in `.github/crate-age-allow.toml` (see "Dependency age" in the README).
+- GitHub Actions are pinned to the full commit SHA of a release at least 14 days old.
 
 ## Testing requirements
 
@@ -88,4 +105,5 @@ Write code so it can be tested in isolation:
 
 - Run `cargo clippy` before submitting -- the lint config is strict
 - Run `cargo deny check` to verify dependency licenses and advisories
+- Releases are cut by the maintainer from a `v*` tag on `main`; the release workflow publishes to crates.io through trusted publishing
 - All public items should have doc comments

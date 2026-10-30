@@ -1,5 +1,10 @@
 [advisories]
-ignore = []
+ignore = [
+    # basic-toml is archived. askama_derive (0.15 and 0.16) uses it at compile
+    # time only, to read askama's optional config file; it is not linked into
+    # the library or anything built with it. Remove once askama drops it.
+    { id = "RUSTSEC-2026-0374", reason = "compile-time only, via askama_derive; no maintained askama release avoids it" },
+]
 
 [licenses]
 allow = [

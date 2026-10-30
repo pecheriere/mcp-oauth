@@ -83,9 +83,41 @@ let app = build_oauth_router(mcp_routes, config);
 - Constant-time secret comparison via [`subtle`](https://docs.rs/subtle)
 - PKCE S256 enforced (no plain)
 - Per-IP rate limiting via [`governor`](https://docs.rs/governor)
-- Supply-chain auditing via [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny)
+- Supply-chain auditing via [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny), on every pull request and nightly
+- Dependency age: a crate version must be at least 14 days old before it enters `Cargo.lock` (see [Dependency age](#dependency-age))
+- Workflows audited by [zizmor](https://docs.zizmor.sh) and code scanned by CodeQL on every pull request
+- Releases publish to crates.io through [trusted publishing](https://crates.io/docs/trusted-publishing): no long-lived registry token exists
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+### Dependency age
+
+Every crate version in `Cargo.lock` must have been published on crates.io at
+least 14 days before it is added, so a compromised or broken release has time to
+be noticed and yanked. On each pull request,
+[`.github/scripts/crate_age.py`](.github/scripts/crate_age.py) compares
+`Cargo.lock` with the base branch's and fails the build for a new or changed
+version younger than 14 days; a lookup that fails fails the check. The release
+workflow runs the same check against the previous release tag, so a tag never
+publishes a version that skipped it. Dependabot waits out the same 14 days.
+
+The one exception is the oldest release that fixes a security advisory. List it
+in [`.github/crate-age-allow.toml`](.github/crate-age-allow.toml), one entry per
+crate version, with a reason that names the RUSTSEC advisory:
+
+```toml
+[[allow]]
+name = "some-crate"
+version = "1.2.3"
+reason = "Oldest release without RUSTSEC-2026-0001"
+```
+
+An entry whose version leaves `Cargo.lock` is stale and fails the check, so it is
+removed with the update that replaces the crate. To run the check locally:
+
+```sh
+python3 -I .github/scripts/crate_age.py --base main
+```
 
 ## License
 

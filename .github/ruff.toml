@@ -1,0 +1,17 @@
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["ALL"]
+ignore = [
+  "D203",   # conflicts with D211 (no blank line before class docstring); ruff requires choosing one
+  "D213",   # conflicts with D212 (summary on first docstring line); ruff requires choosing one
+  "COM812", # conflicts with `ruff format`, per ruff's documentation
+  "CPY001", # the project's license is in LICENSE-APACHE and LICENSE-MIT, not per-file headers
+  "INP001", # .github/scripts holds standalone CI scripts, not an importable package
+  "T201",   # print() is how a CI script emits GitHub annotations (::error)
+  "S603",   # subprocess is only called with a fixed `git` argv, never a shell
+  "S607",   # `git` is resolved from PATH on purpose (the runner's git)
+  "PT009",  # the tests use the standard library's unittest, not pytest
+  "PT027",  # the tests use the standard library's unittest, not pytest
+]

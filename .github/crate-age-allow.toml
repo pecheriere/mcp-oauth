@@ -1,0 +1,5 @@
+# Crate versions allowed into Cargo.lock although they were published less than
+# 14 days before the PR that adds them (see "Dependency age" in the README).
+# One entry per crate version, each with a reason naming the RUSTSEC advisory the
+# release fixes. An entry whose version is no longer in Cargo.lock fails the
+# check: remove it when the crate is updated.

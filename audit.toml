@@ -1,9 +1,0 @@
-[advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-unsound = "deny"
-
-[output]
-deny = ["vulnerability", "unsound", "yanked"]
-warn = ["unmaintained"]

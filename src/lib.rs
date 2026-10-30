@@ -657,13 +657,13 @@ async fn rate_limit_middleware(
     State(limiter): State<Arc<IpRateLimiter>>,
     req: axum::extract::Request,
     next: Next,
-) -> Result<Response, Response> {
+) -> Response {
     let ip = extract_client_ip(&req);
     if limiter.check_key(&ip).is_ok() {
-        Ok(next.run(req).await)
+        next.run(req).await
     } else {
         tracing::warn!("Rate limit exceeded for IP: {ip}");
-        Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded\n").into_response())
+        (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded\n").into_response()
     }
 }
 
@@ -1514,7 +1514,7 @@ async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     State(store): State<AppState<T, C, P>>,
     req: axum::extract::Request,
     next: Next,
-) -> Result<Response, Response> {
+) -> Response {
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -1523,7 +1523,7 @@ async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
     let Some(h) = auth_header.filter(|h| h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer "))
     else {
         tracing::info!("Auth middleware: no Bearer token in request");
-        return Err(unauthorized_response(&store.config.server_url));
+        return unauthorized_response(&store.config.server_url);
     };
     let token = &h[7..];
 
@@ -1545,9 +1545,9 @@ async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
                 tracing::info!(
                     "Auth middleware: converting inner 401 to 404 (session not found, auth was valid)"
                 );
-                return Ok((StatusCode::NOT_FOUND, "Session not found").into_response());
+                return (StatusCode::NOT_FOUND, "Session not found").into_response();
             }
-            Ok(response)
+            response
         }
         Ok(Some(entry)) => {
             tracing::warn!(
@@ -1556,15 +1556,15 @@ async fn auth_middleware<T: TokenStore, C: ClientStore, P: PasskeyStore>(
                 now.saturating_sub(entry.created_at),
                 entry.expires_in_secs
             );
-            Err(unauthorized_response(&store.config.server_url))
+            unauthorized_response(&store.config.server_url)
         }
         Ok(None) => {
             tracing::warn!("Auth middleware: token {}... NOT FOUND", token_prefix,);
-            Err(unauthorized_response(&store.config.server_url))
+            unauthorized_response(&store.config.server_url)
         }
         Err(e) => {
             tracing::error!("Auth middleware: token store error: {e}");
-            Err(unauthorized_response(&store.config.server_url))
+            unauthorized_response(&store.config.server_url)
         }
     }
 }
@@ -2992,7 +2992,7 @@ mod tests {
     fn test_load_passkeys_missing_file() {
         let passkeys =
             store::json_file::load_passkeys(std::path::Path::new("/nonexistent/passkeys.json"));
-        assert!(passkeys.is_empty());
+        assert_eq!(passkeys, []);
     }
 
     #[test]
