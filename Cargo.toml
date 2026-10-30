@@ -21,12 +21,14 @@ sha2 = "0.11"
 base64 = "0.22"
 tracing = "0.1"
 url = "2"
-webauthn-rs = "0.5"
+webauthn-rs = "0.5.5"
 subtle = "2"
-rand = "0.9"
+rand = "0.9.3"
 serde_urlencoded = "0.7"
 governor = "0.10"
-askama = "0.15"
+# Without the default `config` feature: no askama.toml is used, and it pulls in
+# the unmaintained basic-toml (RUSTSEC-2026-0374).
+askama = { version = "0.15", default-features = false, features = ["derive", "std", "urlencode"] }
 thiserror = "2"
 
 [lints.rust]
