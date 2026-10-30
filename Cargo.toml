@@ -30,7 +30,7 @@ serde_urlencoded = "0.7"
 governor = "0.10"
 # Without the default `config` feature: no askama.toml is used, and it pulls in
 # the unmaintained basic-toml (RUSTSEC-2026-0374).
-askama = { version = "0.15", default-features = false, features = ["derive", "std", "urlencode"] }
+askama = { version = "0.16", default-features = false, features = ["derive", "std", "urlencode"] }
 thiserror = "2"
 
 [lints.rust]
