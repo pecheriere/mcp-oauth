@@ -1,9 +1,9 @@
 version: 2
 
-# Version updates wait until a release is 14 days old, the age the crate-age
+# Version updates wait until a release is 7 days old, the age the crate-age
 # check and the action pinning rule require, and minor and patch updates come
 # grouped into one pull request per ecosystem. Security updates skip the
-# cooldown and come one per advisory; a crate release younger than 14 days that
+# cooldown and come one per advisory; a crate release younger than 7 days that
 # fixes an advisory still needs an entry in .github/crate-age-allow.toml.
 updates:
   - package-ecosystem: cargo

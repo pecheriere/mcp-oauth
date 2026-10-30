@@ -57,5 +57,5 @@ jobs:
           "$RUNNER_TEMP/lint/bin/ruff" check .github/scripts
           "$RUNNER_TEMP/lint/bin/ruff" format --check .github/scripts
           python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
-      - name: Refuse crate versions published less than 14 days ago
+      - name: Refuse crate versions published less than 7 days ago
         run: python3 -I .github/scripts/crate_age.py --base HEAD^1

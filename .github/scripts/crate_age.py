@@ -1,10 +1,10 @@
-"""Fail a PR whose Cargo.lock brings in a crate version published less than 14 days ago.
+"""Fail a PR whose Cargo.lock brings in a crate version published less than 7 days ago.
 
 Compares the registry packages in Cargo.lock at a base revision with the working
 tree (or a head revision). Every crates.io version that is new or changed is looked
-up on crates.io, and one published less than 14 days ago fails the check unless
-.github/crate-age-allow.toml lists that exact version with the RUSTSEC advisory it
-fixes. An allow-list entry whose version is no longer in Cargo.lock is stale and
+up on crates.io, and one published less than 7 days ago fails the check unless
+.github/crate-age-allow.toml lists that exact version with the RUSTSEC or GitHub
+(GHSA) advisory it fixes. An allow-list entry whose version is no longer in Cargo.lock is stale and
 fails the check too. With --head, Cargo.lock and the allow-list are both read at
 that revision; with --no-base, every version counts as new.
 
@@ -35,7 +35,7 @@ from typing import IO
 ROOT = Path(__file__).resolve().parent.parent.parent
 LOCKFILE = "Cargo.lock"
 ALLOW_LIST = ".github/crate-age-allow.toml"
-MIN_AGE = timedelta(days=14)
+MIN_AGE = timedelta(days=7)
 # Cargo records crates.io under this source whichever index protocol it used.
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 API = "https://crates.io/api/v1/crates"
@@ -44,7 +44,9 @@ REQUEST_INTERVAL = 1.0
 TIMEOUT = 30
 MAX_RESPONSE_BYTES = 1 << 20
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
-ADVISORY = re.compile(r"\bRUSTSEC-\d{4}-\d{4}\b")
+# A RustSec id, or a GitHub advisory id (GHSA-xxxx-xxxx-xxxx in its own base32
+# alphabet) for advisories RustSec does not carry.
+ADVISORY = re.compile(r"\b(?:RUSTSEC-\d{4}-\d{4}|GHSA(?:-[23456789cfghjmpqrvwx]{4}){3})\b")
 VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
 
 
@@ -132,7 +134,10 @@ def load_allow_list(text: str) -> dict[Crate, str]:
         crate = _crate(entry["name"], entry["version"])
         reason = entry["reason"]
         if not isinstance(reason, str) or not ADVISORY.search(reason):
-            msg = f"allow-list: the reason for {crate} must name the RUSTSEC advisory it fixes"
+            msg = (
+                f"allow-list: the reason for {crate} must name the advisory it fixes "
+                "(RUSTSEC-... or GHSA-...)"
+            )
             raise ValueError(msg)
         if crate in allowed:
             msg = f"allow-list: {crate} is listed twice"

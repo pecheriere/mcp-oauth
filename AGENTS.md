@@ -70,8 +70,8 @@ Source is split across `src/lib.rs` (handlers, router, config) and `src/store/` 
 
 Key crates: `axum` (HTTP), `tokio` (async), `webauthn-rs` (passkeys), `governor` (rate limiting), `sha2`/`subtle` (crypto), `askama` (templates).
 
-- A crate version must have been published at least 14 days before it lands in `Cargo.lock`, except the oldest release that fixes a RUSTSEC advisory, listed in `.github/crate-age-allow.toml` (see "Dependency age" in the README).
-- GitHub Actions are pinned to the full commit SHA of a release at least 14 days old.
+- A crate version must have been published at least 7 days before it lands in `Cargo.lock`, except the oldest release that fixes a security advisory (RUSTSEC or GHSA), listed in `.github/crate-age-allow.toml` (see "Dependency age" in the README).
+- GitHub Actions are pinned to the full commit SHA of a release at least 7 days old.
 
 ## Testing requirements
 

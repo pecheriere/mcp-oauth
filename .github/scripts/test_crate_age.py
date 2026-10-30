@@ -112,6 +112,14 @@ class AllowListTest(unittest.TestCase):
             {Crate("webpki-root-certs", "1.0.10"): "Oldest release fixing RUSTSEC-2026-0383"},
         )
 
+    def test_reads_a_github_advisory(self) -> None:
+        """A GHSA id names an advisory too, for those RustSec does not carry."""
+        text = allow_list(("openssl", "0.10.80", "Oldest release fixing GHSA-phqj-4mhp-q6mq"))
+        self.assertEqual(
+            crate_age.load_allow_list(text),
+            {Crate("openssl", "0.10.80"): "Oldest release fixing GHSA-phqj-4mhp-q6mq"},
+        )
+
     def test_an_empty_file_allows_nothing(self) -> None:
         """No entries is valid."""
         self.assertEqual(crate_age.load_allow_list(""), {})
@@ -125,6 +133,9 @@ class AllowListTest(unittest.TestCase):
             "advisory id malformed": allow_list(("a", "1.0.0", "Fixes RUSTSEC-26-1")),
             "advisory id too long": allow_list(("a", "1.0.0", "Fixes RUSTSEC-2026-00011")),
             "advisory id prefixed": allow_list(("a", "1.0.0", "Fixes XRUSTSEC-2026-0001")),
+            "ghsa id short group": allow_list(("a", "1.0.0", "Fixes GHSA-phqj-4mhp-q6m")),
+            "ghsa id outside alphabet": allow_list(("a", "1.0.0", "Fixes GHSA-phqj-4mhp-q6ma")),
+            "ghsa id prefixed": allow_list(("a", "1.0.0", "Fixes XGHSA-phqj-4mhp-q6mq")),
             "unknown key": '[[allow]]\nname = "a"\nversion = "1"\nreason = "r"\nuntil = "x"\n',
             "not a string": '[[allow]]\nname = "a"\nversion = 1\nreason = "r"\n',
             "unknown table": '[other]\nname = "a"\n',
@@ -171,7 +182,7 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(crate_age.check(base, head, "", lookup, NOW), [])
         self.assertEqual(lookup.calls, [Crate("bytes", "1.5.0"), Crate("serde", "1.0.1")])
 
-    def test_a_new_version_younger_than_14_days_fails(self) -> None:
+    def test_a_new_version_younger_than_7_days_fails(self) -> None:
         """A crate added at a version published three days ago is refused, with its dates."""
         base = lockfile(("tokio", "1.0.0", CRATES_IO))
         head = lockfile(("tokio", "1.0.0", CRATES_IO), ("serde", "1.0.1", CRATES_IO))
@@ -180,19 +191,19 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("serde 1.0.1", errors[0])
         self.assertIn("2026-10-26", errors[0])
-        self.assertIn("2026-11-09", errors[0])
+        self.assertIn("2026-11-02", errors[0])
 
-    def test_a_changed_version_younger_than_14_days_fails(self) -> None:
+    def test_a_changed_version_younger_than_7_days_fails(self) -> None:
         """Changing an existing crate to a new version is checked like adding one."""
         base = lockfile(("serde", "1.0.0", CRATES_IO))
         head = lockfile(("serde", "1.0.1", CRATES_IO))
         lookup = FakeLookup({Crate("serde", "1.0.1"): NEW})
         self.assertEqual(len(crate_age.check(base, head, "", lookup, NOW)), 1)
 
-    def test_exactly_14_days_old_passes(self) -> None:
-        """The boundary is inclusive: 14 days old is old enough."""
+    def test_exactly_7_days_old_passes(self) -> None:
+        """The boundary is inclusive: 7 days old is old enough."""
         head = lockfile(("serde", "1.0.1", CRATES_IO))
-        lookup = FakeLookup({Crate("serde", "1.0.1"): NOW - timedelta(days=14)})
+        lookup = FakeLookup({Crate("serde", "1.0.1"): NOW - timedelta(days=7)})
         self.assertEqual(crate_age.check(lockfile(), head, "", lookup, NOW), [])
 
     def test_a_publish_date_in_the_future_fails(self) -> None:

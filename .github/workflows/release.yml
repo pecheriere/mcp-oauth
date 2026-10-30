@@ -40,7 +40,7 @@ jobs:
       # Pull requests check Cargo.lock against their base, but a push straight to
       # main skips that, so every version added since the previous release is
       # checked again here. The first release has no previous tag and checks all.
-      - name: Refuse crate versions published less than 14 days ago
+      - name: Refuse crate versions published less than 7 days ago
         run: |
           if [ -z "$(git tag --list 'v[0-9]*' --merged HEAD^)" ]; then
             python3 -I .github/scripts/crate_age.py --no-base
