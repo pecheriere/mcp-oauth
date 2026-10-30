@@ -32,3 +32,13 @@ updates:
     commit-message:
       prefix: ci
 
+  # The ruff version the crate-age job lints its scripts with, pinned by hash
+  # in .github/requirements-lint.txt.
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
