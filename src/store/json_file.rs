@@ -877,6 +877,6 @@ mod tests {
         let store = JsonFilePasskeyStore::new(dir.path().join("passkeys.json"));
 
         assert!(!store.has_passkeys().await.unwrap());
-        assert!(store.list_passkeys().await.unwrap().is_empty());
+        assert_eq!(store.list_passkeys().await.unwrap(), []);
     }
 }

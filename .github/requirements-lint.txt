@@ -1,0 +1,7 @@
+# Lint tooling for .github/scripts, installed with --require-hashes in CI.
+# Hashes of the Linux x86_64 and arm64 and macOS wheels, for CI and local runs.
+ruff==0.17.0 \
+    --hash=sha256:bc73e7c133e82d55b5f15897b2a442d72c0cb4a0c886c46801ce3c247150b60c \
+    --hash=sha256:13ee90156522998c3037059d8f66885c8adeeaf7643bdce2caceee196ecd23e0 \
+    --hash=sha256:cbf7149e0927dc3295d5d64679a4765576eef71b00782b2ae969ef82274d6bb9 \
+    --hash=sha256:5f0ca4a40f81403689c04f12966e22f44e329ae362072d8f1587b7bda87f603b

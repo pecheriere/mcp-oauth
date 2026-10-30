@@ -1,9 +1,13 @@
 name: Release
 
+# Publishes the crate to crates.io and creates the GitHub release for a `v*` tag
+# on main, after the full CI and the dependency age check pass. crates.io trusts
+# this workflow through OpenID Connect (trusted publishing), so no long-lived
+# registry token exists.
+
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v[0-9]*']
 
 permissions: {}
 
@@ -11,35 +15,75 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    # Reusable workflow: the caller's job-level permissions are the ceiling
-    # for every job inside ci.yml. Without this block, the top-level
-    # `permissions: {}` propagates as "contents: none" and ci.yml fails at
-    # startup because every inner job requests `contents: read`.
+  on-main:
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-    uses: ./.github/workflows/ci.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tagged commit to be on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  crate-age:
+    needs: on-main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Pull requests check Cargo.lock against their base, but a push straight to
+      # main skips that, so every version added since the previous release is
+      # checked again here. The first release has no previous tag and checks all.
+      - name: Refuse crate versions published less than 7 days ago
+        run: |
+          if [ -z "$(git tag --list 'v[0-9]*' --merged HEAD^)" ]; then
+            python3 -I .github/scripts/crate_age.py --no-base
+          else
+            previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^)
+            python3 -I .github/scripts/crate_age.py --base "$previous"
+          fi
+
+  ci:
+    needs: on-main
+    # A reusable workflow's jobs get at most the permissions its caller grants.
+    permissions:
+      contents: read
+    uses: $/.github/workflows/ci.yml
 
   publish:
-    needs: ci
+    needs: [on-main, crate-age, ci]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+      # Exchanged with crates.io for a short-lived publish token.
+      id-token: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo publish
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+      # No build cache here: a cache written by a pull request must never reach
+      # what gets published.
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: cargo publish --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   github-release:
-    needs: ci
+    needs: publish
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
