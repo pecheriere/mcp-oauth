@@ -72,7 +72,7 @@ use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::TryRngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -102,11 +102,11 @@ use askama::Template;
 // L1: Generate 256-bit cryptographically random tokens (base64url-encoded)
 #[expect(
     clippy::expect_used,
-    reason = "OsRng::try_fill_bytes only fails on catastrophic OS RNG failure; panicking is the correct response for a security-critical token generator"
+    reason = "SysRng::try_fill_bytes only fails on catastrophic OS RNG failure; panicking is the correct response for a security-critical token generator"
 )]
 fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     URL_SAFE_NO_PAD.encode(bytes)

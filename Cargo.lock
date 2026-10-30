@@ -1052,7 +1052,7 @@ dependencies = [
  "axum-test",
  "base64 0.22.1",
  "governor",
- "rand 0.9.5",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "serde_urlencoded",
