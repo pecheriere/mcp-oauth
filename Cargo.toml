@@ -25,7 +25,8 @@ tracing = "0.1"
 url = "2"
 webauthn-rs = "0.5.5"
 subtle = "2"
-rand = "0.9.3"
+# Only the operating system's RNG, for token generation.
+rand = { version = "0.10.3", default-features = false, features = ["sys_rng"] }
 serde_urlencoded = "0.7"
 governor = "0.10"
 # Without the default `config` feature: no askama.toml is used, and it pulls in
