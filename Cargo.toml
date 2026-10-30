@@ -1,8 +1,10 @@
 [package]
 name = "mcp-oauth"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.92"
+# Only what builds the crate and its documentation; CI files stay in the repository.
+include = ["/src", "/templates", "/README.md", "/SECURITY.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 description = "Reusable OAuth 2.1 layer for MCP servers, compatible with Claude.ai"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pecheriere/mcp-oauth"
