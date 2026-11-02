@@ -404,7 +404,9 @@ class GitRepoTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         # main() must never reach crates.io from these tests.
-        self.lookup = FakeLookup({Crate("webpki-root-certs", "1.0.10"): NEW})
+        # main() reads the real clock, so "young" has to be young by that clock, not by NOW.
+        young = datetime.now(UTC) - timedelta(days=3)
+        self.lookup = FakeLookup({Crate("webpki-root-certs", "1.0.10"): young})
         client = mock.patch.object(crate_age, "CratesIo", return_value=self.lookup)
         client.start()
         self.addCleanup(client.stop)
