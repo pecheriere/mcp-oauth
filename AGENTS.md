@@ -6,6 +6,16 @@ Context file for AI coding agents working on this repository.
 
 `mcp-oauth` is a Rust library crate that provides a reusable OAuth 2.1 layer for MCP (Model Context Protocol) servers. It is designed for compatibility with Claude.ai. It is **not** a standalone binary -- consumers import it and call `build_oauth_router()`.
 
+## Tracking work: beads
+
+Work in this repository is tracked with [beads](https://github.com/gastownhall/beads) (`bd`), prefix `mo-`, not GitHub issues. Pull requests name the bead they deliver. GitHub issues stay open for outside reports: each one is triaged into a bead, which links it.
+
+- `bd prime` loads the workflow; `bd ready` lists work with no blockers.
+- Create a bead before starting work, claim it (`bd update <id> --claim`) and close it when the change merges.
+- No markdown TODO lists or memory files: use beads, and `bd remember` for durable project knowledge.
+
+The database runs as a local Dolt server that `bd` starts on demand. Its data lives in `.beads/` in the main checkout and is never committed: worktrees use the main checkout's database.
+
 ## Build & development commands
 
 ```bash
