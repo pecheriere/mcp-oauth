@@ -1,0 +1,99 @@
+name: dependabot-automerge
+
+# Turns on GitHub auto-merge for Dependabot pull requests that update cargo or
+# pip dependencies by a patch or minor version, security updates included.
+# GitHub then squash-merges the pull request once every required check passes
+# on a branch that is up to date with main. Major updates, GitHub Actions and
+# every other ecosystem stay for review, and so does a bump below 1.0 that
+# Cargo semver counts as breaking. Every dependency in a grouped pull request
+# must qualify, so one that doesn't keeps the whole group out.
+#
+# The cooldowns in dependabot.yml and the crate-age check are the age gate that
+# makes this safe: nothing here bypasses them.
+#
+# pull_request, not pull_request_target: a run that Dependabot triggers gets a
+# write token when the job asks for one, and never runs with this
+# repository's secrets on code from a fork.
+
+on:
+  pull_request:
+
+permissions: {}
+
+# One run per pull request at a time, the newest winning, so a run that enables
+# auto-merge cannot finish after a newer one that turned it off.
+concurrency:
+  group: dependabot-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    name: automerge
+    # The pull request's author, not github.actor: the actor is whoever
+    # triggered this run, which can be a person re-running it.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # gh pr merge --auto: the merge writes to main
+      pull-requests: write # turn auto-merge on or off
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      # Decides whether the pull request may merge by itself. It runs even when
+      # fetch-metadata fails, and empty metadata never qualifies, so a failure
+      # turns auto-merge off rather than leaving it on.
+      #
+      # Every updated dependency must be a patch or minor update with a known
+      # previous version. Below 1.0, Cargo semver treats a minor bump
+      # (0.22 -> 0.23) as breaking, and below 0.1 any bump, yet Dependabot
+      # reports them as minor or patch: those stay for review, in pip too.
+      - id: check
+        name: Check eligibility
+        if: ${{ !cancelled() }}
+        run: |
+          eligible=false
+          case "$ECOSYSTEM" in
+            cargo | pip)
+              if printf '%s' "${DEPENDENCIES:-[]}" | jq -e '
+                def breaking_below_one:
+                  (.prevVersion | ltrimstr("v") | split(".")) as $v
+                  | $v[0] == "0"
+                    and (.updateType == "version-update:semver-minor"
+                      or ($v[1] // "0") == "0");
+                length > 0 and all(.[];
+                  (.updateType == "version-update:semver-patch"
+                    or .updateType == "version-update:semver-minor")
+                  and (.prevVersion // "") != ""
+                  and (breaking_below_one | not))
+              ' >/dev/null; then
+                eligible=true
+              fi
+              ;;
+          esac
+          echo "ecosystem=${ECOSYSTEM:-unknown} eligible=$eligible"
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+        env:
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          DEPENDENCIES: ${{ steps.meta.outputs.updated-dependencies-json }}
+
+      - name: Enable auto-merge
+        if: ${{ !cancelled() && steps.check.outputs.eligible == 'true' }}
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
+
+      # Dependabot rewrites a pull request when a newer release comes out, and a
+      # grouped one can then gain a major update. Auto-merge, once on, would
+      # stay on, so turn it off whenever the pull request no longer qualifies.
+      - name: Disable auto-merge
+        if: ${{ !cancelled() && steps.check.outputs.eligible != 'true' }}
+        run: |
+          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
+            gh pr merge --disable-auto "$PR_URL"
+          fi
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
