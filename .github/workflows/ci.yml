@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Bot merges start no push workflow and main does not require branches to be
+  # up to date, so this daily run catches a broken main within a day.
+  schedule:
+    - cron: "41 4 * * *"
   # The release workflow runs these checks on the tagged commit first.
   workflow_call:
 
@@ -63,3 +67,32 @@ jobs:
           python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Refuse crate versions published less than 7 days ago
         run: python3 -I .github/scripts/crate_age.py --base HEAD^1
+
+  report-red-main:
+    needs: [lint-test]
+    if: >-
+      always() && (github.event_name == 'push' || github.event_name == 'schedule')
+      && github.ref == 'refs/heads/main'
+      && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write # to open or comment on the one issue
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          title="CI failed on main"
+          number=$(gh issue list --state open --search "in:title \"$title\"" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "Still failing at $COMMIT: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "Failed at $COMMIT: $RUN_URL
+
+          Fix main before merging anything else, and close this issue once main's CI passes."
+          fi

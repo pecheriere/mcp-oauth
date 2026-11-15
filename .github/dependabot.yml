@@ -7,11 +7,10 @@ version: 2
 # fixes an advisory still needs an entry in .github/crate-age-allow.toml.
 #
 # cargo and pip patch and minor updates merge by themselves once their checks
-# pass (.github/workflows/dependabot-automerge.yml). Main requires branches to
-# be up to date, and Dependabot does not rebase a pull request that is only
-# behind main, so each ecosystem runs on its own day and a merge rarely leaves
-# another pull request behind. Security updates ignore the schedule; a pull
-# request that does fall behind needs its branch updated by hand.
+# pass (.github/workflows/dependabot-automerge.yml). Each ecosystem runs on its
+# own weekday so the pull requests arrive on predictable days. Main does not
+# require branches to be up to date, so a pull request that falls behind still
+# merges on its own checks. Security updates ignore the schedule.
 updates:
   - package-ecosystem: cargo
     directory: /
