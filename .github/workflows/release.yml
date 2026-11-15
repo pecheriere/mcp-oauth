@@ -52,8 +52,11 @@ jobs:
   ci:
     needs: on-main
     # A reusable workflow's jobs get at most the permissions its caller grants.
+    # issues: write is only there because CI's report-red-main job declares it;
+    # that job is skipped on a tag and never gets a token here.
     permissions:
       contents: read
+      issues: write
     uses: $/.github/workflows/ci.yml
 
   publish:

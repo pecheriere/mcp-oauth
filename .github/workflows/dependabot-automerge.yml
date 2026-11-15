@@ -2,11 +2,11 @@ name: dependabot-automerge
 
 # Turns on GitHub auto-merge for Dependabot pull requests that update cargo or
 # pip dependencies by a patch or minor version, security updates included.
-# GitHub then squash-merges the pull request once every required check passes
-# on a branch that is up to date with main. Major updates, GitHub Actions and
-# every other ecosystem stay for review, and so does a bump below 1.0 that
-# Cargo semver counts as breaking. Every dependency in a grouped pull request
-# must qualify, so one that doesn't keeps the whole group out.
+# GitHub then squash-merges the pull request once every required check passes.
+# Major updates, GitHub Actions and every other ecosystem stay for review, and
+# so does a bump below 1.0 that Cargo semver counts as breaking. Every
+# dependency in a grouped pull request must qualify, so one that doesn't keeps
+# the whole group out.
 #
 # The cooldowns in dependabot.yml and the crate-age check are the age gate that
 # makes this safe: nothing here bypasses them.
