@@ -4,9 +4,9 @@ name: dependabot-automerge
 # pip dependencies by a patch or minor version, security updates included.
 # GitHub then squash-merges the pull request once every required check passes.
 # Major updates, GitHub Actions and every other ecosystem stay for review, and
-# so does a bump below 1.0 that Cargo semver counts as breaking. Every
-# dependency in a grouped pull request must qualify, so one that doesn't keeps
-# the whole group out.
+# so does a cargo bump below 1.0 that Cargo semver counts as breaking (pip has
+# no such rule). Every dependency in a grouped pull request must qualify, so one
+# that doesn't keeps the whole group out.
 #
 # The cooldowns in dependabot.yml and the crate-age check are the age gate that
 # makes this safe: nothing here bypasses them.
@@ -48,7 +48,8 @@ jobs:
       # Every updated dependency must be a patch or minor update with a known
       # previous version. Below 1.0, Cargo semver treats a minor bump
       # (0.22 -> 0.23) as breaking, and below 0.1 any bump, yet Dependabot
-      # reports them as minor or patch: those stay for review, in pip too.
+      # reports them as minor or patch: those stay for review. pip has no such
+      # rule, so a pip bump below 1.0 qualifies like any other.
       - id: check
         name: Check eligibility
         if: ${{ !cancelled() }}
@@ -56,7 +57,7 @@ jobs:
           eligible=false
           case "$ECOSYSTEM" in
             cargo | pip)
-              if printf '%s' "${DEPENDENCIES:-[]}" | jq -e '
+              if printf '%s' "${DEPENDENCIES:-[]}" | jq -e --arg eco "$ECOSYSTEM" '
                 def breaking_below_one:
                   (.prevVersion | ltrimstr("v") | split(".")) as $v
                   | $v[0] == "0"
@@ -66,7 +67,7 @@ jobs:
                   (.updateType == "version-update:semver-patch"
                     or .updateType == "version-update:semver-minor")
                   and (.prevVersion // "") != ""
-                  and (breaking_below_one | not))
+                  and ($eco == "pip" or (breaking_below_one | not)))
               ' >/dev/null; then
                 eligible=true
               fi
